@@ -1,0 +1,6 @@
+[
+  {"date": "2026-09-30", "impact": "high", "description": "FOMC rate decision"},
+  {"date": "2026-10-02", "impact": "high", "description": "US Non-Farm Payrolls"},
+  {"date": "2026-10-14", "impact": "medium", "description": "USCPI release"},
+  {"date": "2026-10-20", "impact": "high", "symbol": "SPY", "description": "SPV dividend ex-date"}
+]

@@ -12,21 +12,7 @@ def calc_position_size(
     risk_pct: float = 0.01,
     max_cap_pct: float = 0.10,
 ) -> int:
-    """Return the number of shares risking ``risk_pct`` of the portfolio between entry and stop.
-
-    The size is additionally capped so the position notional never exceeds ``max_cap_pct``
-    of the portfolio (protects against tiny ATR -> huge size).
-
-    Args:
-        portfolio_value: Current portfolio equity.
-        entry_price: Planned entry price.
-        stop_loss_price: Protective stop price (must be below entry for a long).
-        risk_pct: Fraction of portfolio to risk on the trade.
-        max_cap_pct: Maximum fraction of portfolio allocated to the position notional.
-
-    Returns:
-        Integer share count (floored), 0 if inputs are invalid.
-    """
+    """Return the number of shares risking ``risk_pct`` of the portfolio between entry and stop."""
     if portfolio_value <= 0 or entry_price <= 0:
         return 0
     risk_per_share = entry_price - stop_loss_price
