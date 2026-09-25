@@ -74,6 +74,7 @@ def fetch_ticker_data(symbol: str) -> dict:
     if frame.empty:
         raise ValueError(f"Nessun dato da Yahoo Finance per {symbol}")
     frame = frame.copy()
+    # Orders are placed on the raw market tape, so indicators use unadjusted prices (as live_trader does).
     frame["Adj Close"] = frame["Close"]
     data = prepare_data(frame)
     if data.empty:
@@ -133,6 +134,7 @@ def connect_alpaca() -> tuple[object | None, str | None]:
 
 
 def order_plan(data: dict, equity: float) -> tuple[float, float, int]:
+    """Default limit (BB lower), stop (limit - 2 ATR) and share count for a buy."""
     limit = round(data["bb_lower"], 2)
     stop = round(data["bb_lower"] - PARAMS.atr_mult * data["atr"], 2)
     shares = calc_position_size(equity, limit, stop, PARAMS.risk_pct, PARAMS.max_cap_pct)
@@ -148,6 +150,7 @@ def add_log(state, message: str) -> None:
 
 
 def cancel_open_sells(client, alpaca_symbol: str, attempts: int = 10) -> None:
+    """Protective stop legs lock the shares, so they must be cancelled before a market sell."""
     for order in _open_orders(client, alpaca_symbol):
         if order.side == OrderSide.SELL:
             client.cancel_order_by_id(order.id)
@@ -159,6 +162,7 @@ def cancel_open_sells(client, alpaca_symbol: str, attempts: int = 10) -> None:
 
 
 def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
+    """One bot pass over every enabled ticker: exit checks on open positions, entries on signals."""
     enabled = [symbol for symbol, on in state.get("bot_enabled", {}).items() if on]
     if not enabled:
         return
@@ -201,7 +205,7 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
                 add_log(state, f"🤖 {symbol}: segnale attivo ma ordine non dimensionabile")
                 continue
             order_id = place_limit_buy(client, alpaca_symbol, limit, shares, stop)
-            add_log(state, f"🤖 {symbol}: COMPRA limite {shares} az. @ ${limit:,.2f} · stop ${stop:,.2f} (ID {order_id})")
+            add_log(state, f"🤖 {symbol}: COMPRA limite {shares} az. @ ${limit:,.2f} ~ stop ${stop:,.2f} (ID {order_id})")
         except Exception as exc:
             add_log(state, f"🤖 {symbol}: errore {exc}")
 
@@ -254,7 +258,7 @@ def _on_submit_buy(client, symbol: str) -> None:
         st.session_state["panel_msg"][symbol] = ("error", f"Ordine non inviato: {exc}")
         return
     st.session_state["panels"].pop(symbol, None)
-    text = f"Ordine limite inviato: {shares} az. @ ${limit:,.2f} "· stop ${stop:,.2f} (ID {order_id})"
+    text = f"Ordine limite inviato: {shares} az. @ ${limit:,.2f} ~ stop ${stop:,.2f} (ID {order_id})"
     st.session_state["panel_msg"][symbol] = ("success", text)
     add_log(st.session_state, f"👤 {symbol}: {text}")
 
@@ -318,7 +322,7 @@ def render_header(client, account_error: str | None, equity: float | None, posit
 
 def render_buy_panel(client, symbol: str) -> None:
     with st.container(border=True):
-        st.markdown(f"**Compra {symbol}** · ordine limite DAY con stop-loss protettivo")
+        st.markdown(f"**Compra {symbol}** ~ ordine limite DAY con stop-loss protettivo")
         cols = st.columns(3)
         cols[0].number_input("Prezzo limite ($)", min_value=0.0, step=0.01, key=f"buy_limit_{symbol}")
         cols[1].number_input("Stop loss ($)", min_value=0.0, step=0.01, key=f"buy_stop_{symbol}")
@@ -330,7 +334,7 @@ def render_buy_panel(client, symbol: str) -> None:
 
 def render_sell_panel(client, symbol: str, qty: int) -> None:
     with st.container(border=True):
-        st.markdown(f"**Vendi {symbol}** · ordine a mercato")
+        st.markdown(f"**Vendi {symbol}** ~ ordine a mercato")
         st.number_input("Azioni da vendere", min_value=1, max_value=max(1, qty), step=1, key=f"sell_shares_{symbol}")
         st.caption("Gli stop-loss aperti su questo titolo verranno annullati prima della vendita.")
         st.button("Conferma vendita", key=f"sell_submit_{symbol}", type="primary",
@@ -365,9 +369,9 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
     with cols[5]:
         if position is not None:
             pnl = float(position.unrealized_pl or 0)
-            pct = float(position.unrealized_plpc or o) * 100
+            pct = float(position.unrealized_plpc or 0) * 100
             color = "green" if pnl >= 0 else "red"
-            st.markdown(f"{position.qty} az. · :{color}[${-pnl:,.2f} ({pct:+.2f}%)]")
+            st.markdown(f"{position.qty} az. ~ :{color}[${pnl:,.2f} ({pct:+.2f}%)]")
             qty = int(float(position.qty))
             st.button("Vendi", key=f"sell_{symbol}", disabled=not trading_ok, on_click=_on_open_panel,
                       args=(symbol, "sell", {f"sell_shares_{symbol}": max(1, qty)}))
@@ -392,8 +396,8 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
 
 def render_watchlist(client, equity: float | None, positions: dict) -> None:
     for category, symbols in WATCHLIST.items():
-        signals_count = sum(bool(st.session_state["live_data"].get(symbol, {}).get("signal")) for symbol in symbols)
-        with st.expander(f"{category} · {len(symbols)} titoli · {signals_count} segnali", expanded=True):
+        signals = sum(bool(st.session_state["live_data"].get(symbol, {}).get("signal")) for symbol in symbols)
+        with st.expander(f"{category} ~ {len(symbols)} titoli ~ {signals} segnali", expanded=True):
             head = st.columns(ROW_WIDTHS)
             for column, label in zip(head, ("Titolo / Prezzo", "ADX", "RSI", "Segnale", "Bot", "Azioni")):
                 column.caption(label)
@@ -417,16 +421,16 @@ def auto_refresh_countdown() -> None:
         remaining = REFRESH_SECONDS - (datetime.now() - last).total_seconds()
         if remaining <= 0:
             break
-        placeholder.caption(f"⏱ﻏ Prossimo aggiornamento automatico tra {math.ceil(remaining)}s")
+        placeholder.caption(f"⏱️ Prossimo aggiornamento automatico tra {math.ceil(remaining)}s")
         time.sleep(1)
     st.rerun()
 
 
 def main() -> None:
-    st.set_page_config(page_title="Trading Dashboard · Watchlist", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="Trading Dashboard ~ Watchlist", page_icon="📈", layout="wide")
     init_state()
     st.title("📈 Trading Dashboard")
-    st.caption("Alpaca Paper Trading · strategia range: ADX, RSI < 35, prezzo ∤ Bollinger inferiore")
+    st.caption("Alpaca Paper Trading ~ strategia range: ADX < 25, RSI < 35, prezzo ≤ Bollinger inferiore")
 
     client, connect_error = connect_alpaca()
     equity, positions, account_error = load_account(client)
@@ -440,7 +444,7 @@ def main() -> None:
         progress = st.progress(0.0, text="Scarico i dati della watchlist…")
         st.session_state["live_data"] = fetch_all_tickers(
             ALL_SYMBOLS,
-            lambda done, total, symbol: progress.progress(done / total, text=f"Scarico {symbol} ({done}/{total})…),
+            lambda done, total, symbol: progress.progress(done / total, text=f"Scarico {symbol} ({done}/{total})…"),
         )
         progress.empty()
         if client is not None and equity is not None:
