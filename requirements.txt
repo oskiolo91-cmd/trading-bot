@@ -4,3 +4,4 @@ yfinance>=0.2,<1.0
 plotly>=5.0,<7.0
 streamlit>=1.40,<2.0
 pytest>=8.0,<10.0
+alpaca-py>=0.29,<1.0
