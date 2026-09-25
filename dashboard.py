@@ -23,6 +23,19 @@ from models import StrategyParams
 from live_trader import get_account_value, get_alpaca_client, get_latest_bars, get_recent_orders, place_limit_buy, run_signal_check
 from risk import calc_position_size
 
+# Auto-download SPY data on first run
+try:
+    _data_path = BOT_DIR / "data" / "SPY.csv"
+    if not _data_path.exists():
+        import yfinance as yf
+        _data_path.parent.mkdir(exist_ok=True)
+        _df = yf.download("SPY", start="2020-01-01", auto_adjust=False, progress=False)
+        _df.columns = [c[0] if isinstance(c, tuple) else c for c in _df.columns]
+        _df.index.name = "Date"
+        _df.reset_index().to_csv(_data_path, index=False)
+except Exception:
+    pass
+
 TRADE_VIEW_COLUMNS = (
     "entry_date", "exit_date", "entry_price", "exit_price", "shares", "net_pnl", "exit_reason",
 )
@@ -220,7 +233,7 @@ def render_live_trading() -> None:
         )
         cols[1].markdown(
             f'<div style="border-left:4px solid {rsi_color};padding:8px 12px;color:{rsi_color}">'
-            f'RSI<br><strong style="font-size:1.6rem">{values["RSI"]:.2f}</strong></div>',
+            f'RSI4~<strong style="font-size:1.6rem">{values["RSI"]:.2f}</strong></div>',
             unsafe_allow_html=True,
         )
         cols[2].metric("Current Price (Close)", f'${values["Close"]:,.2f}')
