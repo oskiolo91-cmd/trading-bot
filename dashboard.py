@@ -6,12 +6,14 @@ import math
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 from alpaca.trading.client import TradingClient
@@ -54,6 +56,16 @@ REFRESH_SECONDS = 60
 LOG_LIMIT = 200
 ROW_WIDTHS = [1.6, 1, 1, 1.2, 1.5, 1.8]
 PARAMS = StrategyParams()
+PROFILES = {
+    "🐢 Conservativo": StrategyParams(adx_max=20, rsi_max=30, risk_pct=0.005, atr_mult=2.5),
+    "⚖️ Bilanciato": StrategyParams(adx_max=25, rsi_max=35, risk_pct=0.010, atr_mult=2.0),
+    "🚀 Speculativo": StrategyParams(adx_max=35, rsi_max=45, risk_pct=0.020, atr_mult=1.5),
+    "🎛️ Custom": None,
+}
+PROFILE_NAMES = list(PROFILES.keys())
+DEFAULT_PROFILE = "⚖️ Bilanciato"
+CUSTOM_PROFILE = "🎛️ Custom"
+BACKTEST_PERIOD = "90d"
 EASTERN = ZoneInfo("America/New_York")
 NO_KEYS_MESSAGE = (
     "Chiavi Alpaca non configurate: aggiungi ALPACA_API_KEY e ALPACA_SECRET_KEY nei Secrets "
@@ -87,12 +99,69 @@ def fetch_ticker_data(symbol: str) -> dict:
         "bb_lower": float(row["BB_lower"]), "bb_mid": float(row["BB_mid"]), "bb_upper": float(row["BB_upper"]),
         "atr": float(row["ATR"]),
     }
-    values["signal"] = bool(
-        all(math.isfinite(values[name]) for name in ("price", "adx", "rsi", "bb_lower"))
-        and values["adx"] < PARAMS.adx_max and values["rsi"] < PARAMS.rsi_max
-        and values["price"] <= values["bb_lower"]
-    )
+    values["signal"] = compute_signal(values, PARAMS)
     return values
+
+
+def compute_signal(data: dict, params: StrategyParams) -> bool:
+    """Entry signal (ADX < max, RSI < max, price <= BB lower) evaluated with the given profile."""
+    values = [data.get(name) for name in ("price", "adx", "rsi", "bb_lower")]
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values):
+        return False
+    price, adx, rsi, bb_lower = values
+    return bool(adx < params.adx_max and rsi < params.rsi_max and price <= bb_lower)
+
+
+def get_ticker_params(symbol: str, state=None) -> StrategyParams:
+    """Strategy params of the risk profile selected for ``symbol`` (custom profile reads its sliders)."""
+    state = st.session_state if state is None else state
+    name = state.get("profile", {}).get(symbol, DEFAULT_PROFILE)
+    params = PROFILES.get(name, PROFILES[DEFAULT_PROFILE])
+    if params is not None:
+        return params
+    base = PROFILES[DEFAULT_PROFILE]
+    return replace(
+        base,
+        adx_max=float(state.get(f"custom_adx_{symbol}", base.adx_max)),
+        rsi_max=float(state.get(f"custom_rsi_{symbol}", base.rsi_max)),
+        risk_pct=float(state.get(f"custom_risk_{symbol}", base.risk_pct * 100)) / 100,
+        atr_mult=float(state.get(f"custom_atr_{symbol}", base.atr_mult)),
+    )
+
+
+def run_profile_backtest(symbol: str) -> dict[str, BacktestResult]:
+    """Run backtest for all 3 preset profiles on 90 days of data."""
+    frame = yf.download(symbol, period=BACKTEST_PERIOD, interval="1d", auto_adjust=False, progress=False)
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+    if frame.empty:
+        raise ValueError(f"Nessun dato da Yahoo Finance per {symbol}")
+    frame = frame.copy()
+    frame["Adj Close"] = frame["Close"]
+    data = prepare_data(frame)
+    results = {}
+    for name, params in PROFILES.items():
+        if params is None:
+            continue
+        try:
+            results[name] = run_backtest(data, params, symbol=symbol)
+        except Exception:
+            pass
+    return results
+
+
+def backtest_table(results: dict[str, BacktestResult]) -> pd.DataFrame:
+    rows = []
+    for name, result in results.items():
+        metrics = result.metrics
+        rows.append({
+            "Profilo": name,
+            "Rendimento %": round(metrics["return_pct"] * 100, 2),
+            "Win rate %": round(metrics["win_rate"] * 100, 1),
+            "Max drawdown %": round(metrics["max_drawdown"] * 100, 2),
+            "N. trade": int(metrics["total_trades"]),
+        })
+    return pd.DataFrame(rows, columns=["Profilo", "Rendimento %", "Win rate %", "Max drawdown %", "N. trade"])
 
 
 def fetch_all_tickers(symbols: list, on_progress=None) -> dict:
@@ -133,13 +202,13 @@ def connect_alpaca() -> tuple[object | None, str | None]:
         return None, f"Connessione ad Alpaca non riuscita: {exc}"
 
 
-def order_plan(data: dict, equity: float) -> tuple[float, float, int]:
-    """Default limit (BB lower), stop (limit - 2 ATR) and share count for a buy."""
+def order_plan(data: dict, equity: float, params: StrategyParams) -> tuple[float, float, int]:
+    """Default limit (BB lower), stop (limit - atr_mult ATR) and share count for a buy."""
     limit = round(data["bb_lower"], 2)
-    stop = round(data["bb_lower"] - PARAMS.atr_mult * data["atr"], 2)
-    shares = calc_position_size(equity, limit, stop, PARAMS.risk_pct, PARAMS.max_cap_pct)
+    stop = round(data["bb_lower"] - params.atr_mult * data["atr"], 2)
+    shares = calc_position_size(equity, limit, stop, params.risk_pct, params.max_cap_pct)
     if limit > 0:
-        shares = min(shares, math.floor(equity / (limit * (1 + PARAMS.commission_pct))))
+        shares = min(shares, math.floor(equity / (limit * (1 + params.commission_pct))))
     return limit, stop, max(0, shares)
 
 
@@ -177,6 +246,7 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
     for symbol in enabled:
         alpaca_symbol = to_alpaca_symbol(symbol)
         data = state.get("live_data", {}).get(symbol, {})
+        params = get_ticker_params(symbol, state)
         try:
             if alpaca_symbol in positions:
                 if not market_open:
@@ -190,16 +260,16 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
                             exit_state["warned"] = True
                         continue
                     exit_state["position"] = position
-                decision = _check_exit_once(client, alpaca_symbol, exit_state, PARAMS)
+                decision = _check_exit_once(client, alpaca_symbol, exit_state, params)
                 if decision is not None:
                     add_log(state, f"🤖 {symbol}: uscita {decision.reason.value} a ~${decision.price:,.2f}")
                 continue
             bot_state.pop(symbol, None)
-            if not data.get("signal") or last_buy.get(symbol) == today:
+            if not compute_signal(data, params) or last_buy.get(symbol) == today:
                 continue
             if any(order.side == OrderSide.BUY for order in _open_orders(client, alpaca_symbol)):
                 continue
-            limit, stop, shares = order_plan(data, equity)
+            limit, stop, shares = order_plan(data, equity, params)
             last_buy[symbol] = today
             if shares <= 0 or not 0 < stop < limit:
                 add_log(state, f"🤖 {symbol}: segnale attivo ma ordine non dimensionabile")
@@ -215,6 +285,9 @@ def init_state() -> None:
         "bot_enabled": {symbol: False for symbol in ALL_SYMBOLS},
         "live_data": {}, "bot_log": [], "bot_state": {}, "bot_last_buy": {},
         "panels": {}, "panel_msg": {}, "bot_notice": {}, "auto_refresh": True,
+        "profile": {symbol: DEFAULT_PROFILE for symbol in ALL_SYMBOLS},
+        "backtest_open": {},
+        "backtest_cache": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -235,6 +308,21 @@ def _on_toggle(symbol: str) -> None:
     st.session_state["bot_enabled"][symbol] = enabled
     st.session_state["bot_notice"][symbol] = enabled
     add_log(st.session_state, f"🤖 {symbol}: bot {'ATTIVATO' if enabled else 'disattivato'}")
+
+
+def _on_profile_change(symbol: str) -> None:
+    name = st.session_state.get(f"profile_{symbol}", DEFAULT_PROFILE)
+    st.session_state["profile"][symbol] = name
+    add_log(st.session_state, f"⚙️ {symbol}: profilo di rischio {name}")
+
+
+def _on_toggle_backtest(symbol: str) -> None:
+    opened = st.session_state["backtest_open"]
+    opened[symbol] = not opened.get(symbol, False)
+
+
+def _on_rerun_backtest(symbol: str) -> None:
+    st.session_state["backtest_cache"].pop(symbol, None)
 
 
 def _on_open_panel(symbol: str, kind: str, defaults: dict) -> None:
@@ -283,16 +371,16 @@ def _fmt(value: float, pattern: str = "{:,.2f}") -> str:
     return pattern.format(value) if isinstance(value, (int, float)) and math.isfinite(value) else "—"
 
 
-def adx_label(adx: float) -> str:
+def adx_label(adx: float, params: StrategyParams = PARAMS) -> str:
     if not math.isfinite(adx):
         return "ADX —"
-    return f":{'green' if adx < PARAMS.adx_max else 'red'}[ADX **{adx:.1f}**]"
+    return f":{'green' if adx < params.adx_max else 'red'}[ADX **{adx:.1f}**]"
 
 
-def rsi_label(rsi: float) -> str:
+def rsi_label(rsi: float, params: StrategyParams = PARAMS) -> str:
     if not math.isfinite(rsi):
         return "RSI —"
-    color = "green" if rsi < PARAMS.rsi_max else ("orange" if rsi <= 50 else "red")
+    color = "green" if rsi < params.rsi_max else ("orange" if rsi <= 50 else "red")
     return f":{color}[RSI **{rsi:.1f}**]"
 
 
@@ -341,10 +429,64 @@ def render_sell_panel(client, symbol: str, qty: int) -> None:
                   on_click=_on_submit_sell, args=(client, symbol))
 
 
+def render_custom_sliders(symbol: str) -> None:
+    base = PROFILES[DEFAULT_PROFILE]
+    defaults = {f"custom_adx_{symbol}": float(base.adx_max), f"custom_rsi_{symbol}": float(base.rsi_max),
+                f"custom_risk_{symbol}": base.risk_pct * 100, f"custom_atr_{symbol}": float(base.atr_mult)}
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    with st.container(border=True):
+        st.caption(f"🎛️ Profilo Custom ~ {symbol}")
+        cols = st.columns(4)
+        cols[0].slider("ADX max", 15.0, 50.0, step=1.0, key=f"custom_adx_{symbol}")
+        cols[1].slider("RSI max", 25.0, 60.0, step=1.0, key=f"custom_rsi_{symbol}")
+        cols[2].slider("Risk %", 0.1, 5.0, step=0.1, key=f"custom_risk_{symbol}")
+        cols[3].slider("Stop ATR mult", 1.0, 3.0, step=0.1, key=f"custom_atr_{symbol}")
+
+
+def backtest_chart(table: pd.DataFrame) -> go.Figure:
+    metrics = ["Rendimento %", "Win rate %", "Max drawdown %", "N. trade"]
+    fig = make_subplots(rows=1, cols=len(metrics), subplot_titles=metrics)
+    colors = ["#2e7d32", "#1565c0", "#e65100"]
+    for index, row in table.reset_index(drop=True).iterrows():
+        for position, metric in enumerate(metrics, start=1):
+            fig.add_trace(go.Bar(x=[row["Profilo"]], y=[row[metric]], name=row["Profilo"],
+                                 marker_color=colors[index % len(colors)], showlegend=position == 1,
+                                 legendgroup=row["Profilo"], text=[row[metric]], textposition="auto"),
+                          row=1, col=position)
+    fig.update_xaxes(showticklabels=False)
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.1))
+    return fig
+
+
+def render_backtest_panel(symbol: str) -> None:
+    cache = st.session_state["backtest_cache"]
+    with st.container(border=True):
+        st.markdown(f"**📊 Backtest comparativo {symbol}** ~ ultimi 90 giorni, capitale simulato $100.000")
+        if symbol not in cache:
+            with st.spinner(f"Backtest di {symbol} sui 3 profili…"):
+                try:
+                    cache[symbol] = run_profile_backtest(symbol)
+                except Exception as exc:
+                    cache[symbol] = str(exc)
+        results = cache[symbol]
+        if isinstance(results, str) or not results:
+            st.error(f"Backtest non disponibile: {results or 'nessun risultato'}")
+        else:
+            table = backtest_table(results)
+            st.plotly_chart(backtest_chart(table), key=f"backtest_chart_{symbol}")
+            st.dataframe(table, hide_index=True)
+            st.caption("Uscite: trailing stop 3%, time stop 10 candele, stop-loss ATR del profilo.")
+        st.button("🔄 Ricalcola", key=f"backtest_rerun_{symbol}", on_click=_on_rerun_backtest, args=(symbol,))
+
+
 def render_ticker_row(symbol: str, client, equity: float | None, positions: dict) -> None:
     data = st.session_state["live_data"].get(symbol, {})
     trading_ok = client is not None and equity is not None
     position = positions.get(to_alpaca_symbol(symbol))
+    params = get_ticker_params(symbol)
+    signal = compute_signal(data, params)
     cols = st.columns(ROW_WIDTHS, vertical_alignment="center")
 
     if "price" not in data:
@@ -353,11 +495,15 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
         change = (data["price"] / data["prev_close"] - 1) * 100 if data["prev_close"] else float("nan")
         delta = f":{'green' if change >= 0 else 'red'}[{change:+.2f}%]" if math.isfinite(change) else ""
         cols[0].markdown(f"**{symbol}**  \n${_fmt(data['price'])} {delta}")
-        cols[1].markdown(adx_label(data["adx"]))
-        cols[2].markdown(rsi_label(data["rsi"]))
-    cols[3].markdown("🟢 **Segnale**" if data.get("signal") else "🔴 No segnale")
+        cols[1].markdown(adx_label(data["adx"], params))
+        cols[2].markdown(rsi_label(data["rsi"], params))
+    cols[3].markdown("🟢 **Segnale**" if signal else "🔴 No segnale")
 
     with cols[4]:
+        if f"profile_{symbol}" not in st.session_state:
+            st.session_state[f"profile_{symbol}"] = st.session_state["profile"].get(symbol, DEFAULT_PROFILE)
+        st.selectbox(f"Profilo {symbol}", PROFILE_NAMES, key=f"profile_{symbol}", label_visibility="collapsed",
+                     on_change=_on_profile_change, args=(symbol,))
         st.toggle(f"Bot {symbol}", key=f"bot_{symbol}", disabled=not trading_ok,
                   on_change=_on_toggle, args=(symbol,))
         if st.session_state["bot_enabled"].get(symbol):
@@ -378,11 +524,15 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
         else:
             defaults = {}
             if trading_ok and "price" in data and math.isfinite(data["atr"]) and math.isfinite(data["bb_lower"]):
-                limit, stop, shares = order_plan(data, equity)
+                limit, stop, shares = order_plan(data, equity, params)
                 defaults = {f"buy_limit_{symbol}": max(0.0, limit), f"buy_stop_{symbol}": max(0.0, stop),
                             f"buy_shares_{symbol}": shares, f"buy_confirm_{symbol}": False}
             st.button("Compra", key=f"buy_{symbol}", disabled=not defaults, on_click=_on_open_panel,
                       args=(symbol, "buy", defaults))
+        st.button("📊 Backtest", key=f"backtest_{symbol}", on_click=_on_toggle_backtest, args=(symbol,))
+
+    if st.session_state["profile"].get(symbol) == CUSTOM_PROFILE:
+        render_custom_sliders(symbol)
 
     message = st.session_state["panel_msg"].get(symbol)
     if message:
@@ -392,14 +542,17 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
         render_buy_panel(client, symbol)
     elif panel == "sell" and trading_ok and position is not None:
         render_sell_panel(client, symbol, int(float(position.qty)))
+    if st.session_state["backtest_open"].get(symbol):
+        render_backtest_panel(symbol)
 
 
 def render_watchlist(client, equity: float | None, positions: dict) -> None:
     for category, symbols in WATCHLIST.items():
-        signals = sum(bool(st.session_state["live_data"].get(symbol, {}).get("signal")) for symbol in symbols)
+        signals = sum(compute_signal(st.session_state["live_data"].get(symbol, {}), get_ticker_params(symbol))
+                      for symbol in symbols)
         with st.expander(f"{category} ~ {len(symbols)} titoli ~ {signals} segnali", expanded=True):
             head = st.columns(ROW_WIDTHS)
-            for column, label in zip(head, ("Titolo / Prezzo", "ADX", "RSI", "Segnale", "Bot", "Azioni")):
+            for column, label in zip(head, ("Titolo / Prezzo", "ADX", "RSI", "Segnale", "Profilo / Bot", "Azioni")):
                 column.caption(label)
             for symbol in symbols:
                 render_ticker_row(symbol, client, equity, positions)
@@ -430,7 +583,8 @@ def main() -> None:
     st.set_page_config(page_title="Trading Dashboard ~ Watchlist", page_icon="📈", layout="wide")
     init_state()
     st.title("📈 Trading Dashboard")
-    st.caption("Alpaca Paper Trading ~ strategia range: ADX < 25, RSI < 35, prezzo ≤ Bollinger inferiore")
+    st.caption("Alpaca Paper Trading ~ strategia range: ADX < max, RSI < max, prezzo ≤ Bollinger inferiore "
+               "(soglie e rischio dal profilo di ogni titolo)")
 
     client, connect_error = connect_alpaca()
     equity, positions, account_error = load_account(client)
