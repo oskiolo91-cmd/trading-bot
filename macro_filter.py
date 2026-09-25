@@ -23,6 +23,6 @@ def is_risk_off_day(day, calendar, symbol=None, impact_level="high"):
         if _to_date(event["date"]) == target: return True
     return False
 
-def has_risk_off_within(start, calendar, days_ahead=1, symbol=None, impact_level="high":
+def has_risk_off_within(start, calendar, days_ahead=1, symbol=None, impact_level="high"):
     base = _to_date(start)
-    return any(is_risk_off_day(base+timedelta(days=o), calendar,symbol,impact_level) for o in range(days_ahead+1))
+    return any(is_risk_off_day(base+timedelta(days=o), calendar, symbol, impact_level) for o in range(days_ahead+1))
