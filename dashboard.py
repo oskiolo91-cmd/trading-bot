@@ -19,7 +19,11 @@ if str(BOT_DIR) not in sys.path:
 
 from backtest import BacktestResult, load_ohlcv_csv, prepare_data, run_backtest
 from models import StrategyParams
-from live_trader import get_account_value, get_alpaca_client, get_recent_orders, run_signal_check
+from risk import calc_position_size
+from live_trader import (
+    get_account_value, get_alpaca_client, get_latest_bars,
+    get_recent_orders, place_limit_buy, run_signal_check,
+)
 
 TRADE_VIEW_COLUMNS = (
     "entry_date", "exit_date", "entry_price", "exit_price", "shares", "net_pnl", "exit_reason",
@@ -37,7 +41,7 @@ def load_data(path: str, modified_ns: int) -> pd.DataFrame:
     return load_ohlcv_csv(path)
 
 
-def run_dashboard_backtest(raw: pd.DataFrame, params: StrategyParams, portfolio_value: float) -> tuple[pd.DataFrame, BacktestResult]:
+def run_dashboard_backtest(raw: pd.DataFrame, params: StrategyParams, portfolio_value: float):
     if raw.empty: raise ValueError("No valid OHLCV rows.")
     prepared = prepare_data(raw)
     if prepared.empty: raise ValueError("No valid OHLCV rows.")
@@ -46,9 +50,13 @@ def run_dashboard_backtest(raw: pd.DataFrame, params: StrategyParams, portfolio_
 
 def price_figure(prices: pd.DataFrame, trades: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=prices.index, open=prices["Open"], high=prices["High"], low=prices["Low"], close=prices["Close"], name="Price", increasing_line_color="#16a34a", decreasing_line_color="#dc2626"))
-    for column, color in (("BB_upper", "#818cf8"), ("BB_mid", "#f59e0b"), ("BB_lower", "#818cf8")):
-        fig.add_trace(go.Scatter(x=prices.index, y=prices[column], mode="lines", name=column.replace("_", " "), line=dict(color=color, width=1.5, dash="dot" if column != "BB_mid" else "solid")))
+    fig.add_trace(go.Candlestick(
+        x=prices.index, open=prices["Open"], high=prices["High"],
+        low=prices["Low"], close=prices["Close"], name="Price",
+        increasing_line_color="#16a34a", decreasing_line_color="#dc2626",
+    ))
+    for col, color in (("BB_upper", "#818cf8"), ("BB_mid", "#f59e0b"), ("BB_lower", "#818cf8")):
+        fig.add_trace(go.Scatter(x=prices.index, y=prices[col], mode="lines", name=col.replace("_", " "), line=dict(color=color, width=1.5, dash="dot" if col != "BB_mid" else "solid")))
     if not trades.empty:
         fig.add_trace(go.Scatter(x=trades["entry_date"], y=trades["entry_price"], mode="markers", name="Buy", marker=dict(symbol="triangle-up", color="#22c55e", size=12)))
         for reason, color in EXIT_COLORS.items():
@@ -69,13 +77,13 @@ def equity_figure(equity: pd.Series) -> go.Figure:
     return fig
 
 
-def trades_table(trades: pd.DataFrame) -> pd.io.formats.style.Styler:
+def trades_table(trades: pd.DataFrame):
     view = trades.loc[:, list(TRADE_VIEW_COLUMNS)].copy()
     for c in ("entry_date", "exit_date"): view[c] = pd.to_datetime(view[c]).dt.strftime("%Y-%m-%d")
     def color_row(row):
-        c = "background-color:rgba(34,197,94,0.15)" if row["net_pnl"]>0 else ("background-color:rgba(239,68,68,0.15)" if row["net_pnl"]<0 else "")
-        return [c]*len(row)
-    return view.style.apply(color_row, axis=1).format({"entry_price":"${:,.2f}","exit_price":"${:,.2f}","net_pnl":"${:,.2f}"})
+        c = "background-color:rgba(34,197,94,0.15)" if row["net_pnl"] > 0 else ("background-color:rgba(239,68,68,0.15)" if row["net_pnl"] < 0 else "")
+        return [c] * len(row)
+    return view.style.apply(color_row, axis=1).format({"entry_price": "${:,.2f}", "exit_price": "${:,.2f}", "net_pnl": "${:,.2f}"})
 
 
 def _live_keys():
@@ -86,9 +94,100 @@ def _live_keys():
     return os.environ.get("ALPACA_API_KEY") or k, os.environ.get("ALPACA_SECRET_KEY") or s
 
 
-def render_live_trading():
+def _indicator_color_adx(value: float) -> str:
+    return "#22c55e" if value < 25 else "#ef4444"
+
+
+def _indicator_color_rsi(value: float) -> str:
+    if value < 35: return "#22c55e"
+    if value < 50: return "#f59e0b"
+    return "#ef4444"
+
+
+def render_signal_monitor(client: TradingClient, account_value: float) -> None:
+    """Signal monitor + manual trading override panel."""
+    st.subheader("Monitor segnale & ordine manuale")
+    sym = st.text_input("Ticker", value="SPY", placeholder="es. AAPL, SPY").strip().upper()
+    analyze = st.button("Analizza", type="secondary")
+    if not analyze:
+        return
+    if not sym:
+        st.warning("Inserisci un ticker."); return
+    try:
+        bars = get_latest_bars(sym)
+        data = prepare_data(bars)
+    except Exception as exc:
+        st.error(f"Errore nel caricamento dati per {sym}: {exc}"); return
+    if data.empty:
+        st.warning(f"Nessun dato per {sym}."); return
+    row = data.iloc[-1]
+    adx = float(row["ADX"]) if not pd.isna(row["ADX"]) else None
+    rsi = float(row["RSI"]) if not pd.isna(row["RSI"]) else None
+    bb_lower = float(row["BB_lower"]) if not pd.isna(row["BB_lower"]) else None
+    bb_mid = float(row["BB_mid"]) if not pd.isna(row["BB_mid"]) else None
+    bb_upper = float(row["BB_upper"]) if not pd.isna(row["BB_upper"]) else None
+    atr = float(row["ATR"]) if not pd.isna(row["ATR"]) else None
+    price = float(row["Close"])
+    st.write("**Indicatori ultima candela giornaliera**")
+    cols = st.columns(6)
+    cols[0].metric("Prezzo", f"${price:,.2f}")
+    cols[1].metric("ADX", f"{adx:.1f}" if adx is not None else "n/a", help="<25: mercato laterale (ok)")
+    cols[2].metric("RSI", f"{rs:&.1f}" if rsi is not None else "n/a", help="<35: ipervenduto (ok)")
+    cols[3].metric("BB Lower", f"${bb_lower:,.2f}" if bb_lower is not None else "n/a")
+    cols[4].metric("BB Mid", f"${bb_mid:,.2f}" if bb_mid is not None else "n/a")
+    cols[5].metric("ATR", f"{atr:,.2f}" if atr is not None else "n/a")
+    c1 = adx is not None and adx < 25
+    c2 = bsol= price <= bb_lower if bb_lower is not None else False
+    c3 = rsi is not None and rsi < 35
+    score = sum([c1, c2, c3])
+    if score == 3:
+        st.success("<b>😂&৳ Segnale ATTIVO -- tutte le condizioni soddisfatte</b>", icon="")
+    elif score > 0:
+        conds = [f"ADX<25: {'✓' if c1 else 'x'}", f"Prezzo≥BB Lower: {'✓' if c2 else 'x'}", f"RSI<35: {'✓' if c3 else 'x'}"]
+        st.warning(f"Segnale PARZIALE -- {score}/3 condizioni: {', '.join(conds)}")
+    else:
+        st.error("Nessun segnale -- condizioni non soddisfatte")
+    if bb_lower is not None and atr is not None:
+        default_stop = round(max(bb_lower - 2 * atr, 0.01), 2)
+        default_shares = calc_position_size(account_value, bb_lower, default_stop)
+    else:
+        default_stop = round(max(price * 0.97, 0.01), 2)
+        default_shares = 1
+    st.divider()
+    st.write("**Ordine automatico (segnale strategia)**")
+    if score == 3:
+        if st.button(f"Esegui ordine automatico {sym}", type="primary"):
+            try:
+                signal = run_signal_check(sym, account_value)
+                if signal is None:
+                    st.warning("Segnale non validato al novo controllo.")
+                else:
+                    oid = place_limit_buy(client, sym, signal.limit_price, signal.shares, signal.stop_loss)
+                    st.success(f"Ordine piaziato -- id: {oid} | limit: ${signal.limit_price:.2f} | stop: ${signal.stop_loss:.2f} | {_signal.shares} azioni")
+        except Exception as exc:
+            st.error(f"Errore ordine: {exc}")
+    else:
+        st.button(f"Esegui ordine automatico {sym}", disabled=True, help="Disabilitato: non tutte le condizioni soddisfatte")
+    with st.expander("Override manuale"):
+        st.caption("Usa questa sezione per piazjare un ordine anche senza segnale automatico.")
+        man_limit = st.number_input("Prezfo limite ($)", min_value=0.01, value=float(round(bb_lower or price * 0.99, 2)), step=0.01)
+        man_stop = st.number_input("Stop loss ($)", min_value=0.01, value=float(default_stop), step=0.01)
+        man_shares = st.number_input("Numero azioni", min_value=1, value=int(max(default_shares, 1)), step=1)
+        confirm = st.checkbox("Confermo di voler comprare anche senza segnale automatico")
+        if st.button("Compra ora (manuale)", type="primary", disabled=not confirm):
+            if man_stop >= man_limit:
+                st.error("Lo stop loss deve essere inferiore al prezzo limite.")
+            else:
+                try:
+                    oid = place_limit_buy(client, sym, man_limit, int(man_shares), man_stop)
+                    st.success(f"Ordine manuale piazzato -- id: {oid} | {sym} | limit: ${man_limit:.2f} | stop: ${man_stop:.2f} | {int(man_shares)} azioni")
+                except Exception as exc:
+                    st.error(f"Errore ordine manuale: {exc}")
+
+
+def render_live_trading() -> None:
     with st.expander("Live Trading (Paper)"):
-        st.caption("Read-only account view · Check Signal Now does not place an order")
+        st.caption("Read-only account view & ordini su Alpaca Paper")
         key, secret = _live_keys()
         if not key or not secret:
             st.error("API keys not configured. Set ALPACA_API_KEY and ALPACA_SECRET_KEY in Streamlit secrets.")
@@ -112,20 +211,11 @@ def render_live_trading():
             st.dataframe(pd.DataFrame(orders), hide_index=True, use_container_width=True)
         else:
             st.info("No recent orders.")
-        sym = st.text_input("Symbol for signal check", value="SPY").strip().upper()
-        if st.button("Check Signal Now"):
-            if not sym: st.warning("Enter a symbol first."); return
-            try:
-                signal = run_signal_check(sym, account_value, StrategyParams())
-            except Exception:
-                st.error("Could not check signal."); return
-            if signal is None:
-                st.info(f"No entry signal for {sym} on the latest daily bar.")
-            else:
-                st.success(f"{sym}: buy limit ${signal.limit_price:.2f} · {signal.shares} shares · stop ${signal.stop_loss:.2f} (not submitted)")
+        st.divider()
+        render_signal_monitor(client, account_value)
 
 
-def main():
+def main() -> None:
     st.set_page_config(page_title="Trading Bot · Backtest", page_icon="📈", layout="wide")
     st.title("Trading Bot · Backtest")
     st.caption("SPY daily data · Bollinger range strategy with trailing stop")
