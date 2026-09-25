@@ -1,33 +1,38 @@
-"""Interactive dashboard for the existing candle-by-candle trading backtest."""
+"""Watchlist trading dashboard: live indicators, per-ticker bots and manual paper orders."""
 
 from __future__ import annotations
 
 import math
 import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide
 
 BOT_DIR = Path(__file__).resolve().parent
-DATA_DIR = BOT_DIR / "data"
-
 if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 from backtest import BacktestResult, load_ohlcv_csv, prepare_data, run_backtest
 from models import StrategyParams
-from live_trader import get_account_value, get_alpaca_client, get_latest_bars, get_recent_orders, place_limit_buy, run_signal_check
+from live_trader import (
+    _check_exit_once, _initial_position, _open_orders, get_account_value, get_alpaca_client,
+    get_latest_bars, get_recent_orders, place_limit_buy, place_market_sell, run_signal_check,
+)
 from risk import calc_position_size
 
 # Auto-download SPY data on first run
 try:
     _data_path = BOT_DIR / "data" / "SPY.csv"
     if not _data_path.exists():
-        import yfinance as yf
         _data_path.parent.mkdir(exist_ok=True)
         _df = yf.download("SPY", start="2020-01-01", auto_adjust=False, progress=False)
         _df.columns = [c[0] if isinstance(c, tuple) else c for c in _df.columns]
@@ -36,314 +41,426 @@ try:
 except Exception:
     pass
 
-TRADE_VIEW_COLUMNS = (
-    "entry_date", "exit_date", "entry_price", "exit_price", "shares", "net_pnl", "exit_reason",
-)
-EXIT_COLORS = {
-    "trailing_stop": "#22c55e",
-    "time_stop": "#f59e0b",
-    "stop_loss": "#ef4444",
-    "end_of_data": "#94a3b8",
+
+WATCHLIST = {
+    "Big Tech": ["AAPL", "MSFT", "GOOGL", "NVDA", "META", "AMZN", "TSLA", "AMD", "INTC", "ORCL"],
+    "Difesa": ["LMT", "RTX", "NOC", "GD", "BA", "HII", "LHX", "AXON", "KTOS"],
+    "Energia / Materie prime": ["XOM", "CVX", "COP", "SLB", "OXY", "FCX", "NEM", "AA", "CLF"],
+    "ETF": ["SPY", "QQQ", "DIA", "GLD", "SLV", "USO", "XLE", "XLK", "XLI"],
+    "Finance": ["JPM", "GS", "BRK-B", "V", "MA"],
 }
+ALL_SYMBOLS = [symbol for symbols in WATCHLIST.values() for symbol in symbols]
+REFRESH_SECONDS = 60
+LOG_LIMIT = 200
+ROW_WIDTHS = [1.6, 1, 1, 1.2, 1.5, 1.8]
+PARAMS = StrategyParams()
+EASTERN = ZoneInfo("America/New_York")
+NO_KEYS_MESSAGE = (
+    "Chiavi Alpaca non configurate: aggiungi ALPACA_API_KEY e ALPACA_SECRET_KEY nei Secrets "
+    "dell'app (Streamlit Cloud → Settings → Secrets). Bot e ordini sono disattivati, "
+    "la watchlist resta consultabile."
+)
 
 
-@st.cache_data
-def load_data(path: str, modified_ns: int) -> pd.DataFrame:
-    """Cache a CSV until its modification timestamp changes."""
-    return load_ohlcv_csv(path)
+def to_alpaca_symbol(symbol: str) -> str:
+    """Yahoo uses BRK-B, Alpaca uses BRK.B."""
+    return symbol.replace("-", ".")
 
 
-def run_dashboard_backtest(raw: pd.DataFrame, params: StrategyParams, portfolio_value: float) -> tuple[pd.DataFrame, BacktestResult]:
-    if raw.empty:
-        raise ValueError("The selected CSV contains no valid OHLCV rows.")
-    prepared = prepare_data(raw)
-    if prepared.empty:
-        raise ValueError("The selected CSV contains no valid OHLCV rows.")
-    return prepared, run_backtest(prepared, params, portfolio_value, symbol="SPY")
-
-
-def price_figure(prices: pd.DataFrame, trades: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=prices.index, open=prices["Open"], high=prices["High"],
-        low=prices["Low"], close=prices["Close"], name="Price",
-        increasing_line_color="#16a34a", decreasing_line_color="#dc2626",
-    ))
-    for column, color in (("BB_upper", "#818cf8"), ("BB_mid", "#f59e0b"), ("BB_lower", "#818cf8")):
-        fig.add_trace(go.Scatter(
-            x=prices.index, y=prices[column], mode="lines", name=column.replace("_", " "),
-            line=dict(color=color, width=1.5, dash="dot" if column != "BB_mid" else "solid"),
-        ))
-    if not trades.empty:
-        fig.add_trace(go.Scatter(
-            x=trades["entry_date"], y=trades["entry_price"], mode="markers", name="Buy",
-            marker=dict(symbol="triangle-up", color="#22c55e", size=12, line=dict(color="#14532d", width=1)),
-            hovertemplate="Buy · %{x|%Y-%m-%d}<br>$%{y:,.2f}<extra></extra>",
-        ))
-        for reason, color in EXIT_COLORS.items():
-            exits = trades.loc[trades["exit_reason"] == reason]
-            if exits.empty:
-                continue
-            fig.add_trace(go.Scatter(
-                x=exits["exit_date"], y=exits["exit_price"], mode="markers",
-                name=f"Sell · {reason.replace('_', ' ')}",
-                marker=dict(symbol="triangle-down", color=color, size=12, line=dict(color="#1e293b", width=1)),
-                hovertemplate=f"Sell ({reason.replace('_', ' ')}) · %{{x|%Y-%m-%d}}<br>$%{{y:,.2f}}<extra></extra>",
-            ))
-    fig.update_layout(
-        xaxis_title="Date", yaxis_title="Adjusted price ($)", xaxis_rangeslider_visible=False,
-        hovermode="x unified", height=580, margin=dict(l=8, r=8, t=20, b=8),
-        legend=dict(orientation="h", y=1.08),
+def fetch_ticker_data(symbol: str) -> dict:
+    frame = yf.download(symbol, period="60d", interval="1d", auto_adjust=False, progress=False)
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+    if frame.empty:
+        raise ValueError(f"Nessun dato da Yahoo Finance per {symbol}")
+    frame = frame.copy()
+    frame["Adj Close"] = frame["Close"]
+    data = prepare_data(frame)
+    if data.empty:
+        raise ValueError(f"Nessuna candela valida per {symbol}")
+    row = data.iloc[-1]
+    values = {
+        "price": float(row["Close"]),
+        "prev_close": float(data["Close"].iloc[-2]) if len(data) > 1 else float("nan"),
+        "adx": float(row["ADX"]), "rsi": float(row["RSI"]),
+        "bb_lower": float(row["BB_lower"]), "bb_mid": float(row["BB_mid"]), "bb_upper": float(row["BB_upper"]),
+        "atr": float(row["ATR"]),
+    }
+    values["signal"] = bool(
+        all(math.isfinite(values[name]) for name in ("price", "adx", "rsi", "bb_lower"))
+        and values["adx"] < PARAMS.adx_max and values["rsi"] < PARAMS.rsi_max
+        and values["price"] <= values["bb_lower"]
     )
-    return fig
+    return values
 
 
-def equity_figure(equity: pd.Series) -> go.Figure:
-    peak = equity.cummax()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=equity.index, y=peak, mode="lines", name="Previous peak",
-        line=dict(color="rgba(239,68,68,0)", width=0), showlegend=False, hoverinfo="skip",
-    ))
-    fig.add_trace(go.Scatter(
-        x=equity.index, y=equity, mode="lines", name="Drawdown",
-        line=dict(color="rgba(239,68,68,0)", width=0), fill="tonexty",
-        fillcolor="rgba(239,68,68,0.16)", hoverinfo="skip",
-    ))
-    fig.add_trace(go.Scatter(
-        x=equity.index, y=equity, mode="lines", name="Portfolio value",
-        line=dict(color="#2563eb", width=2),
-        hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.2f}<extra></extra>",
-    ))
-    fig.update_layout(
-        xaxis_title="Date", yaxis_title="Portfolio value ($)", hovermode="x unified",
-        height=380, margin=dict(l=8, r=8, t=20, b=8),
-    )
-    return fig
+def fetch_all_tickers(symbols: list, on_progress=None) -> dict:
+    results: dict[str, dict] = {}
+    for index, symbol in enumerate(symbols, start=1):
+        try:
+            results[symbol] = {**fetch_ticker_data(symbol), "last_updated": datetime.now()}
+        except Exception as exc:
+            results[symbol] = {"error": str(exc), "signal": False, "last_updated": datetime.now()}
+        if on_progress is not None:
+            on_progress(index, len(symbols), symbol)
+    return results
 
 
-def trades_table(trades: pd.DataFrame) -> pd.io.formats.style.Styler:
-    view = trades.loc[:, TRADE_VIEW_COLUMNS].copy()
-    for column in ("entry_date", "exit_date"):
-        view[column] = pd.to_datetime(view[column]).dt.strftime("%Y-%m-%d")
-
-    def color_row(row: pd.Series) -> list[str]:
-        color = "background-color: rgba(34, 197, 94, 0.15)" if row["net_pnl"] > 0 else (
-            "background-color: rgba(239, 68, 68, 0.15)" if row["net_pnl"] < 0 else ""
-        )
-        return [color] * len(row)
-
-    return view.style.apply(color_row, axis=1).format({
-        "entry_price": "${:,.2f}", "exit_price": "${:,.2f}", "net_pnl": "${:,.2f}",
-    })
+def get_positions_map(client) -> dict:
+    return {position.symbol: position for position in client.get_all_positions()}
 
 
 def _live_credentials() -> tuple[str | None, str | None, bool]:
     try:
         secret_key = st.secrets.get("ALPACA_API_KEY")
         secret_value = st.secrets.get("ALPACA_SECRET_KEY")
-    except (FileNotFoundError, KeyError):
+    except Exception:
         secret_key = secret_value = None
-    return (
-        os.environ.get("ALPACA_API_KEY") or secret_key,
-        os.environ.get("ALPACA_SECRET_KEY") or secret_value,
-        bool(os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_SECRET_KEY")),
-    )
+    key = os.environ.get("ALPACA_API_KEY") or secret_key
+    secret = os.environ.get("ALPACA_SECRET_KEY") or secret_value
+    return key, secret, bool(os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_SECRET_KEY"))
 
 
-def render_live_trading() -> None:
-    with st.expander("Live Trading (Paper)"):
-        st.caption("Alpaca Paper Trading · gli ordini qui vengono inviati al conto paper")
-        key, secret, from_env = _live_credentials()
-        if not key or not secret:
-            st.error("API keys not configured (ALPACA_API_KEY and ALPACA_SECRET_KEY)")
+def connect_alpaca() -> tuple[object | None, str | None]:
+    key, secret, from_env = _live_credentials()
+    if not key or not secret:
+        return None, NO_KEYS_MESSAGE
+    try:
+        client = get_alpaca_client() if from_env else TradingClient(api_key=key, secret_key=secret, paper=True)
+        return client, None
+    except Exception as exc:
+        return None, f"Connessione ad Alpaca non riuscita: {exc}"
+
+
+def order_plan(data: dict, equity: float) -> tuple[float, float, int]:
+    limit = round(data["bb_lower"], 2)
+    stop = round(data["bb_lower"] - PARAMS.atr_mult * data["atr"], 2)
+    shares = calc_position_size(equity, limit, stop, PARAMS.risk_pct, PARAMS.max_cap_pct)
+    if limit > 0:
+        shares = min(shares, math.floor(equity / (limit * (1 + PARAMS.commission_pct))))
+    return limit, stop, max(0, shares)
+
+
+def add_log(state, message: str) -> None:
+    log = state.setdefault("bot_log", [])
+    log.append(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}")
+    del log[:-LOG_LIMIT]
+
+
+def cancel_open_sells(client, alpaca_symbol: str, attempts: int = 10) -> None:
+    for order in _open_orders(client, alpaca_symbol):
+        if order.side == OrderSide.SELL:
+            client.cancel_order_by_id(order.id)
+    for _ in range(attempts):
+        if not any(order.side == OrderSide.SELL for order in _open_orders(client, alpaca_symbol)):
             return
+        time.sleep(0.5)
+    raise RuntimeError("lo stop-loss non risulta ancora annullato, riprova tra qualche secondo")
+
+
+def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
+    enabled = [symbol for symbol, on in state.get("bot_enabled", {}).items() if on]
+    if not enabled:
+        return
+    try:
+        market_open = bool(client.get_clock().is_open)
+    except Exception as exc:
+        add_log(state, f"🤖 Impossibile leggere l'orario di mercato: {exc}")
+        return
+    today = datetime.now(EASTERN).date()
+    bot_state = state.setdefault("bot_state", {})
+    last_buy = state.setdefault("bot_last_buy", {})
+    for symbol in enabled:
+        alpaca_symbol = to_alpaca_symbol(symbol)
+        data = state.get("live_data", {}).get(symbol, {})
         try:
-            client = get_alpaca_client() if from_env else TradingClient(api_key=key, secret_key=secret, paper=True)
-            account_value = get_account_value(client)
-            positions = client.get_all_positions()
-            orders = get_recent_orders(client)
-        except Exception:
-            st.error("Could not reach Alpaca Paper Trading. Check credentials and connection.")
-            return
-        st.metric("Account equity", f"${account_value:,.2f}")
-        st.subheader("Open positions")
-        if positions:
-            st.dataframe(pd.DataFrame([{
-                "Symbol": item.symbol, "Shares": item.qty, "Avg entry ($)": item.avg_entry_price,
-                "Market value ($)": item.market_value, "Unrealized P&L ($)": item.unrealized_pl,
-            } for item in positions]), hide_index=True, width="stretch")
+            if alpaca_symbol in positions:
+                if not market_open:
+                    continue
+                exit_state = bot_state.setdefault(symbol, {})
+                if "position" not in exit_state:
+                    position = _initial_position(client, alpaca_symbol)
+                    if position is None:
+                        if not exit_state.get("warned"):
+                            add_log(state, f"🤖 {symbol}: posizione senza stop protettivo, gestiscila a mano")
+                            exit_state["warned"] = True
+                        continue
+                    exit_state["position"] = position
+                decision = _check_exit_once(client, alpaca_symbol, exit_state, PARAMS)
+                if decision is not None:
+                    add_log(state, f"🤖 {symbol}: uscita {decision.reason.value} a ~${decision.price:,.2f}")
+                continue
+            bot_state.pop(symbol, None)
+            if not data.get("signal") or last_buy.get(symbol) == today:
+                continue
+            if any(order.side == OrderSide.BUY for order in _open_orders(client, alpaca_symbol)):
+                continue
+            limit, stop, shares = order_plan(data, equity)
+            last_buy[symbol] = today
+            if shares <= 0 or not 0 < stop < limit:
+                add_log(state, f"🤖 {symbol}: segnale attivo ma ordine non dimensionabile")
+                continue
+            order_id = place_limit_buy(client, alpaca_symbol, limit, shares, stop)
+            add_log(state, f"🤖 {symbol}: COMPRA limite {shares} az. @ ${limit:,.2f} · stop ${stop:,.2f} (ID {order_id})")
+        except Exception as exc:
+            add_log(state, f"🤖 {symbol}: errore {exc}")
+
+
+def init_state() -> None:
+    defaults = {
+        "bot_enabled": {symbol: False for symbol in ALL_SYMBOLS},
+        "live_data": {}, "bot_log": [], "bot_state": {}, "bot_last_buy": {},
+        "panels": {}, "panel_msg": {}, "bot_notice": {}, "auto_refresh": True,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def needs_refresh() -> bool:
+    last = st.session_state.get("last_refresh")
+    return last is None or (datetime.now() - last).total_seconds() >= REFRESH_SECONDS
+
+
+def _on_refresh_now() -> None:
+    st.session_state["last_refresh"] = None
+
+
+def _on_toggle(symbol: str) -> None:
+    enabled = bool(st.session_state.get(f"bot_{symbol}"))
+    st.session_state["bot_enabled"][symbol] = enabled
+    st.session_state["bot_notice"][symbol] = enabled
+    add_log(st.session_state, f"🤖 {symbol}: bot {'ATTIVATO' if enabled else 'disattivato'}")
+
+
+def _on_open_panel(symbol: str, kind: str, defaults: dict) -> None:
+    panels = st.session_state["panels"]
+    st.session_state["panel_msg"].pop(symbol, None)
+    if panels.get(symbol) == kind:
+        panels.pop(symbol)
+        return
+    panels[symbol] = kind
+    for key, value in defaults.items():
+        st.session_state[key] = value
+
+
+def _on_submit_buy(client, symbol: str) -> None:
+    limit = float(st.session_state[f"buy_limit_{symbol}"])
+    stop = float(st.session_state[f"buy_stop_{symbol}"])
+    shares = int(st.session_state[f"buy_shares_{symbol}"])
+    try:
+        order_id = place_limit_buy(client, to_alpaca_symbol(symbol), limit, shares, stop)
+    except Exception as exc:
+        st.session_state["panel_msg"][symbol] = ("error", f"Ordine non inviato: {exc}")
+        return
+    st.session_state["panels"].pop(symbol, None)
+    text = f"Ordine limite inviato: {shares} az. @ ${limit:,.2f} "· stop ${stop:,.2f} (ID {order_id})"
+    st.session_state["panel_msg"][symbol] = ("success", text)
+    add_log(st.session_state, f"👤 {symbol}: {text}")
+
+
+def _on_submit_sell(client, symbol: str) -> None:
+    shares = int(st.session_state[f"sell_shares_{symbol}"])
+    alpaca_symbol = to_alpaca_symbol(symbol)
+    try:
+        cancel_open_sells(client, alpaca_symbol)
+        order_id = place_market_sell(client, alpaca_symbol, shares)
+    except Exception as exc:
+        st.session_state["panel_msg"][symbol] = ("error", f"Vendita non inviata: {exc}")
+        return
+    st.session_state["panels"].pop(symbol, None)
+    st.session_state["bot_state"].pop(symbol, None)
+    text = f"Vendita a mercato inviata: {shares} az. (ID {order_id})"
+    st.session_state["panel_msg"][symbol] = ("success", text)
+    add_log(st.session_state, f"👤 {symbol}: {text}")
+
+
+def _fmt(value: float, pattern: str = "{:,.2f}") -> str:
+    return pattern.format(value) if isinstance(value, (int, float)) and math.isfinite(value) else "—"
+
+
+def adx_label(adx: float) -> str:
+    if not math.isfinite(adx):
+        return "ADX —"
+    return f":{'green' if adx < PARAMS.adx_max else 'red'}[ADX **{adx:.1f}**]"
+
+
+def rsi_label(rsi: float) -> str:
+    if not math.isfinite(rsi):
+        return "RSI —"
+    color = "green" if rsi < PARAMS.rsi_max else ("orange" if rsi <= 50 else "red")
+    return f":{color}[RSI **{rsi:.1f}**]"
+
+
+def render_header(client, account_error: str | None, equity: float | None, positions: dict) -> None:
+    cols = st.columns(4)
+    bots = sum(bool(on) for on in st.session_state["bot_enabled"].values())
+    if client is None or equity is None:
+        cols[0].metric("Account Equity", "—")
+        cols[1].metric("Posizioni aperte", "—")
+        cols[2].metric("P&L oggi (non realizzato)", "—")
+        cols[3].metric("Bot attivi", bots)
+        st.warning(account_error or NO_KEYS_MESSAGE)
+        return
+    today_pl = 0.0
+    for position in positions.values():
+        value = getattr(position, "unrealized_intraday_pl", None)
+        if value is None:
+            value = getattr(position, "unrealized_pl", 0)
+        today_pl += float(value or 0)
+    cols[0].metric("Account Equity", f"${equity:,.2f}")
+    cols[1].metric("Posizioni aperte", len(positions))
+    cols[2].metric("P&L oggi (non realizzato)", f"${today_pl:,.2f}", delta=f"{today_pl:,.2f}")
+    cols[3].metric("Bot attivi", bots)
+    if account_error:
+        st.warning(account_error)
+
+
+def render_buy_panel(client, symbol: str) -> None:
+    with st.container(border=True):
+        st.markdown(f"**Compra {symbol}** · ordine limite DAY con stop-loss protettivo")
+        cols = st.columns(3)
+        cols[0].number_input("Prezzo limite ($)", min_value=0.0, step=0.01, key=f"buy_limit_{symbol}")
+        cols[1].number_input("Stop loss ($)", min_value=0.0, step=0.01, key=f"buy_stop_{symbol}")
+        cols[2].number_input("Azioni", min_value=0, step=1, key=f"buy_shares_{symbol}")
+        confirmed = st.checkbox("Confermo l'ordine", key=f"buy_confirm_{symbol}")
+        st.button("Invia ordine", key=f"buy_submit_{symbol}", type="primary", disabled=not confirmed,
+                  on_click=_on_submit_buy, args=(client, symbol))
+
+
+def render_sell_panel(client, symbol: str, qty: int) -> None:
+    with st.container(border=True):
+        st.markdown(f"**Vendi {symbol}** · ordine a mercato")
+        st.number_input("Azioni da vendere", min_value=1, max_value=max(1, qty), step=1, key=f"sell_shares_{symbol}")
+        st.caption("Gli stop-loss aperti su questo titolo verranno annullati prima della vendita.")
+        st.button("Conferma vendita", key=f"sell_submit_{symbol}", type="primary",
+                  on_click=_on_submit_sell, args=(client, symbol))
+
+
+def render_ticker_row(symbol: str, client, equity: float | None, positions: dict) -> None:
+    data = st.session_state["live_data"].get(symbol, {})
+    trading_ok = client is not None and equity is not None
+    position = positions.get(to_alpaca_symbol(symbol))
+    cols = st.columns(ROW_WIDTHS, vertical_alignment="center")
+
+    if "price" not in data:
+        cols[0].markdown(f"**{symbol}**  \n:gray[{str(data.get('error', 'in caricamento…'))[:60]}]")
+    else:
+        change = (data["price"] / data["prev_close"] - 1) * 100 if data["prev_close"] else float("nan")
+        delta = f":{'green' if change >= 0 else 'red'}[{change:+.2f}%]" if math.isfinite(change) else ""
+        cols[0].markdown(f"**{symbol}**  \n${_fmt(data['price'])} {delta}")
+        cols[1].markdown(adx_label(data["adx"]))
+        cols[2].markdown(rsi_label(data["rsi"]))
+    cols[3].markdown("🟢 **Segnale**" if data.get("signal") else "🔴 No segnale")
+
+    with cols[4]:
+        st.toggle(f"Bot {symbol}", key=f"bot_{symbol}", disabled=not trading_ok,
+                  on_change=_on_toggle, args=(symbol,))
+        if st.session_state["bot_enabled"].get(symbol):
+            st.markdown(":blue[🤖 Bot attivo]")
+        notice = st.session_state["bot_notice"].pop(symbol, None)
+        if notice:
+            st.caption("✅ Attivato: agirà al prossimo aggiornamento")
+
+    with cols[5]:
+        if position is not None:
+            pnl = float(position.unrealized_pl or 0)
+            pct = float(position.unrealized_plpc or o) * 100
+            color = "green" if pnl >= 0 else "red"
+            st.markdown(f"{position.qty} az. · :{color}[${-pnl:,.2f} ({pct:+.2f}%)]")
+            qty = int(float(position.qty))
+            st.button("Vendi", key=f"sell_{symbol}", disabled=not trading_ok, on_click=_on_open_panel,
+                      args=(symbol, "sell", {f"sell_shares_{symbol}": max(1, qty)}))
         else:
-            st.info("No open positions.")
-        st.subheader("Recent orders (last 10)")
-        if orders:
-            st.dataframe(pd.DataFrame(orders), hide_index=True, width="stretch")
-        else:
-            st.info("No recent orders.")
+            defaults = {}
+            if trading_ok and "price" in data and math.isfinite(data["atr"]) and math.isfinite(data["bb_lower"]):
+                limit, stop, shares = order_plan(data, equity)
+                defaults = {f"buy_limit_{symbol}": max(0.0, limit), f"buy_stop_{symbol}": max(0.0, stop),
+                            f"buy_shares_{symbol}": shares, f"buy_confirm_{symbol}": False}
+            st.button("Compra", key=f"buy_{symbol}", disabled=not defaults, on_click=_on_open_panel,
+                      args=(symbol, "buy", defaults))
 
-        st.subheader("Signal Monitor & Manual Trading")
-        symbol = st.text_input("Ticker", value="SPY").strip().upper()
-        if st.button("Analyze"):
-            st.session_state.pop("signal_monitor", None)
-            if not symbol:
-                st.warning("Inserisci un ticker prima di analizzare.")
-            else:
-                try:
-                    data = prepare_data(get_latest_bars(symbol))
-                    if data.empty:
-                        raise ValueError("Nessuna candela giornaliera disponibile.")
-                    row = data.iloc[-1]
-                    values = {name: float(row[name]) for name in
-                              ("Close", "ADX", "RSI", "BB_lower", "BB_mid", "BB_upper", "ATR")}
-                    if not all(math.isfinite(value) for value in values.values()):
-                        raise ValueError("Indicatori non disponibili per l'ultima candela.")
-                    st.session_state["signal_monitor"] = (symbol, data.index[-1], values)
-                    st.session_state["manual_limit"] = max(0.0, round(values["BB_lower"], 2))
-                    st.session_state["manual_stop"] = max(0.0, round(values["BB_lower"] - 2 * values["ATR"], 2))
-                    st.session_state["manual_confirm"] = False
-                    st.session_state["manual_shares"] = calc_position_size(
-                        account_value, values["BB_lower"], values["BB_lower"] - 2 * values["ATR"],
-                    )
-                except Exception as exc:
-                    st.error(f"Impossibile analizzare {symbol}: {exc}")
+    message = st.session_state["panel_msg"].get(symbol)
+    if message:
+        (st.success if message[0] == "success" else st.error)(message[1])
+    panel = st.session_state["panels"].get(symbol)
+    if panel == "buy" and trading_ok and position is None:
+        render_buy_panel(client, symbol)
+    elif panel == "sell" and trading_ok and position is not None:
+        render_sell_panel(client, symbol, int(float(position.qty)))
 
-        analysis = st.session_state.get("signal_monitor")
-        if analysis is None:
-            return
-        if analysis[0] != symbol:
-            st.session_state.pop("signal_monitor", None)
-            return
-        _, bar_date, values = analysis
-        st.caption(f"Ultima candela giornaliera: {bar_date:%Y-%m-%d}")
-        params = StrategyParams()
-        conditions = {
-            f"ADX < {params.adx_max:g} (mercato laterale)": values["ADX"] < params.adx_max,
-            f"RSI < {params.rsi_max:g} (ipervenduto)": values["RSI"] < params.rsi_max,
-            "Close ≤ BB Lower": values["Close"] <= values["BB_lower"],
-        }
-        adx_color = "#16a34a" if values["ADX"] < params.adx_max else "#dc2626"
-        rsi_color = "#16a34a" if values["RSI"] < params.rsi_max else (
-            "#ea580c" if values["RSI"] <= 50 else "#dc2626"
-        )
-        cols = st.columns(4)
-        cols[0].markdown(
-            f'<div style="border-left:4px solid {adx_color};padding:8px 12px;color:{adx_color}">'
-            f'ADX<br><strong style="font-size:1.6rem">{values["ADX"]:.2f}</strong></div>',
-            unsafe_allow_html=True,
-        )
-        cols[1].markdown(
-            f'<div style="border-left:4px solid {rsi_color};padding:8px 12px;color:{rsi_color}">'
-            f'RSI4~<strong style="font-size:1.6rem">{values["RSI"]:.2f}</strong></div>',
-            unsafe_allow_html=True,
-        )
-        cols[2].metric("Current Price (Close)", f'${values["Close"]:,.2f}')
-        cols[3].metric("ATR", f'${values["ATR"]:,.2f}')
-        bands = st.columns(3)
-        for column, name in zip(bands, ("BB_lower", "BB_mid", "BB_upper")):
-            column.metric(name.replace("_", " "), f'${values[name]:,.2f}')
 
-        passed = sum(conditions.values())
-        if passed == 3:
-            st.success("🟢 Segnale ATTIVO — tutte le condizioni soddisfatte")
-        elif passed:
-            details = " · ".join(f'{"✅" if ok else "❌"} {name}' for name, ok in conditions.items())
-            st.warning(f"🟡 Segnale PARZIALE — {passed}/3 condizioni soddisfatte\n\n{details}")
-        else:
-            st.error("🔴 Nessun segnale — condizioni non soddisfatte")
+def render_watchlist(client, equity: float | None, positions: dict) -> None:
+    for category, symbols in WATCHLIST.items():
+        signals_count = sum(bool(st.session_state["live_data"].get(symbol, {}).get("signal")) for symbol in symbols)
+        with st.expander(f"{category} · {len(symbols)} titoli · {signals_count} segnali", expanded=True):
+            head = st.columns(ROW_WIDTHS)
+            for column, label in zip(head, ("Titolo / Prezzo", "ADX", "RSI", "Segnale", "Bot", "Azioni")):
+                column.caption(label)
+            for symbol in symbols:
+                render_ticker_row(symbol, client, equity, positions)
 
-        limit = values["BB_lower"]
-        stop = limit - params.atr_mult * values["ATR"]
-        shares = calc_position_size(account_value, limit, stop, params.risk_pct, params.max_cap_pct)
-        if limit > 0:
-            shares = min(shares, math.floor(account_value / (limit * (1 + params.commission_pct))))
-        can_buy = (passed == 3 and shares > 0 and round(stop, 2) > 0
-                   and round(stop, 2) < round(limit, 2))
-        if passed == 3 and not can_buy:
-            st.info("Segnale attivo, ma non è possibile dimensionare un ordine valido.")
-        if st.button("Esegui ordine automatico", disabled=not can_buy):
-            try:
-                signal = run_signal_check(symbol, account_value, params)
-                if signal is None:
-                    st.error("Segnale non validato al novo controllo. Riprova.")
-                else:
-                    order_id = place_limit_buy(client, symbol, signal.limit_price, signal.shares, signal.stop_loss)
-                    st.success(
-                        f"Ordine paper inviato per {symbol} (ID {order_id}): "
-                        f"limite ${signal.limit_price:.2f} · {signal.shares} azioni · stop loss ${signal.stop_loss:.2f}"
-                    )
-            except Exception as exc:
-                st.error(f"Ordine automatico non inviato: {exc}")
 
-        with st.expander("Override manuale"):
-            manual_limit = st.number_input("Prezzo limite ($)", min_value=0.0, step=0.01, key="manual_limit")
-            manual_stop = st.number_input("Stop loss ($)", min_value=0.0, step=0.01, key="manual_stop")
-            manual_shares = st.number_input("Numero azioni", min_value=0, step=1, key="manual_shares")
-            confirmed = st.checkbox("Confermo di voler comprare anche senza segnale automatico", key="manual_confirm")
-            if st.button("Compra ora (manuale)", disabled=not confirmed):
-                try:
-                    order_id = place_limit_buy(client, symbol, manual_limit, manual_shares, manual_stop)
-                    st.success(
-                        f"Ordine paper manuale inviato per {symbol} (ID {order_id}): "
-                        f"limite ${manual_limit:.2f} · {manual_shares} azioni · stop loss ${manual_stop:.2f}"
-                    )
-                except Exception as exc:
-                    st.error(f"Ordine manuale non inviato: {exc}")
+def load_account(client) -> tuple[float | None, dict, str | None]:
+    if client is None:
+        return None, {}, None
+    try:
+        return get_account_value(client), get_positions_map(client), None
+    except Exception as exc:
+        return None, {}, f"Alpaca non raggiungibile (bot e ordini disattivati): {exc}"
+
+
+def auto_refresh_countdown() -> None:
+    placeholder = st.empty()
+    while True:
+        last = st.session_state.get("last_refresh") or datetime.now()
+        remaining = REFRESH_SECONDS - (datetime.now() - last).total_seconds()
+        if remaining <= 0:
+            break
+        placeholder.caption(f"⏱ﻏ Prossimo aggiornamento automatico tra {math.ceil(remaining)}s")
+        time.sleep(1)
+    st.rerun()
 
 
 def main() -> None:
-    st.set_page_config(page_title="Trading Bot · Backtest", page_icon="📈", layout="wide")
-    st.title("Trading Bot · Backtest")
-    st.caption("SPY daily data · Bollinger range strategy · adjusted prices")
+    st.set_page_config(page_title="Trading Dashboard · Watchlist", page_icon="📈", layout="wide")
+    init_state()
+    st.title("📈 Trading Dashboard")
+    st.caption("Alpaca Paper Trading · strategia range: ADX, RSI < 35, prezzo ∤ Bollinger inferiore")
 
-    files = sorted(DATA_DIR.rglob("*.csv")) if DATA_DIR.exists() else []
-    if not files:
-        st.warning("No CSV files found in data/. Download SPY.csv before running the backtest.")
-        return
-    options = [str(path.relative_to(BOT_DIR)) for path in files]
-    default = options.index("data/SPY.csv") if "data/SPY.csv" in options else 0
-    with st.sidebar:
-        st.header("Backtest settings")
-        selected = st.selectbox("CSV file", options, index=default)
-        risk = st.slider("Risk %", 0.1, 3.0, 1.0, 0.1, format="%.1f%%")
-        trailing = st.slider("Trailing stop %", 1.0, 10.0, 3.0, 0.5, format="%.1f%%")
-        time_stop = st.slider("Time-stop candles", 5, 30, 10)
-        commission = st.slider("Commission %", 0.05, 0.5, 0.1, 0.05, format="%.2f%%")
-        portfolio = st.number_input("Portfolio value ($)", min_value=1.0, value=100_000.0, step=1_000.0)
-        run = st.button("Run Backtest", type="primary", width="stretch")
+    client, connect_error = connect_alpaca()
+    equity, positions, account_error = load_account(client)
+    render_header(client, account_error or connect_error, equity, positions)
 
-    if not run:
-        st.info("Set your parameters, then click Run Backtest.")
-        render_live_trading()
-        return
+    controls = st.columns([3, 1, 1], vertical_alignment="center")
+    controls[1].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
+    controls[2].toggle("Auto-refresh 60s", key="auto_refresh")
 
-    params = StrategyParams(
-        risk_pct=risk / 100, trailing_pct=trailing / 100,
-        time_stop=time_stop, commission_pct=commission / 100,
-    )
-    selected_path = BOT_DIR / selected
-    try:
-        raw = load_data(str(selected_path), selected_path.stat().st_mtime_ns)
-        prepared, result = run_dashboard_backtest(raw, params, portfolio)
-    except (OSError, ValueError, KeyError) as exc:
-        st.error(f"Could not run backtest: {exc}")
-        return
+    if needs_refresh():
+        progress = st.progress(0.0, text="Scarico i dati della watchlist…")
+        st.session_state["live_data"] = fetch_all_tickers(
+            ALL_SYMBOLS,
+            lambda done, total, symbol: progress.progress(done / total, text=f"Scarico {symbol} ({done}/{total})…),
+        )
+        progress.empty()
+        if client is not None and equity is not None:
+            run_bot_cycle(client, st.session_state, positions, equity)
+        st.session_state["last_refresh"] = datetime.now()
+    controls[0].caption(f"Ultimo aggiornamento dati: {st.session_state['last_refresh']:%H:%M:%S}")
+    if any(st.session_state["bot_enabled"].values()):
+        st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
 
-    metrics = result.metrics
-    cols = st.columns(4)
-    cols[0].metric("Net P&L", f"${metrics['net_pnl_total']:,.2f}")
-    cols[1].metric("Win Rate", f"{metrics['win_rate']:.1%}")
-    cols[2].metric("Max Drawdown", f"{metrics['max_drawdown']:.1%}")
-    cols[3].metric("Total Trades", f"{metrics['total_trades']:,}")
+    render_watchlist(client, equity, positions)
 
-    if result.trades.empty:
-        st.warning("No trades found for these settings and this data range.")
-    st.subheader("Price & signals")
-    st.plotly_chart(price_figure(prepared, result.trades), width="stretch")
-    st.subheader("Equity curve")
-    st.plotly_chart(equity_figure(result.equity), width="stretch")
-    st.subheader("Trades")
-    st.dataframe(trades_table(result.trades), width="stretch", hide_index=True)
-    render_live_trading()
+    with st.expander("Log Bot", expanded=False):
+        entries = st.session_state["bot_log"][-20:]
+        if entries:
+            st.code("\n".join(reversed(entries)), language=None)
+        else:
+            st.caption("Nessuna azione registrata.")
+
+    if st.session_state["auto_refresh"]:
+        auto_refresh_countdown()
 
 
 if __name__ == "__main__":
