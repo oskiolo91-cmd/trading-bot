@@ -19,7 +19,7 @@ class ExitReason(str, Enum):
 
 @dataclass(frozen=True)
 class Order:
-    """A resting buy limit order, valid for the next candle only."""
+    """A resting buy limit order, including split size for the live scale-out."""
 
     created_date: pd.Timestamp
     limit_price: float
@@ -27,6 +27,8 @@ class Order:
     shares: int
     side: str = "BUY"
     take_profit_price: float | None = None
+    shares_1: int | None = None
+    shares_2: int | None = None
 
 
 @dataclass(frozen=True)
@@ -63,3 +65,6 @@ class StrategyParams:
     atr_mult: float = 2.0
     adx_max: float = 25.0
     rsi_max: float = 35.0
+    risk_reward: float = 2.0
+    daily_target_pct: float = 0.02
+    max_daily_drawdown_pct: float = 0.02
