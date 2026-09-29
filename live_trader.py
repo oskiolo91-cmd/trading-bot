@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, StopLossRequest
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, StopLossRequest, TakeProfitRequest
 import pandas as pd
 import yfinance as yf
 
@@ -56,18 +56,36 @@ def has_open_position(client: TradingClient, symbol: str) -> bool:
     return position is not None and float(position.qty) != 0
 
 
-def place_limit_buy(client: TradingClient, symbol: str, limit_price: float, shares: int, stop_loss_price: float) -> str:
+def place_limit_buy(
+    client: TradingClient,
+    symbol: str,
+    limit_price: float,
+    shares: int,
+    stop_loss_price: float,
+    take_profit_price: float = None,
+) -> str:
     if not (math.isfinite(limit_price) and math.isfinite(stop_loss_price)) or not (0 < stop_loss_price < limit_price) or shares <= 0:
         raise ValueError("Invalid buy order price, stop or share count")
     limit = round(limit_price, 2)
     stop = round(stop_loss_price, 2)
     if not 0 < stop < limit:
         raise ValueError("Stop must be below the rounded limit price")
-    request = LimitOrderRequest(
-        symbol=symbol, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
-        limit_price=limit, order_class=OrderClass.OTO,
-        take_profit=None, stop_loss=StopLossRequest(stop_price=stop),
-    )
+
+    if take_profit_price is not None:
+        if not math.isfinite(take_profit_price) or take_profit_price <= limit:
+            raise ValueError("Invalid take profit price")
+        request = LimitOrderRequest(
+            symbol=symbol, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+            limit_price=limit, order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
+            stop_loss=StopLossRequest(stop_price=stop),
+        )
+    else:
+        request = LimitOrderRequest(
+            symbol=symbol, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+            limit_price=limit, order_class=OrderClass.OTO,
+            take_profit=None, stop_loss=StopLossRequest(stop_price=stop),
+        )
     return str(client.submit_order(order_data=request).id)
 
 
@@ -103,11 +121,19 @@ def run_signal_check(symbol: str = "SPY", portfolio_value: float = 100_000.0, pa
     if limit is None or not math.isfinite(row["ATR"]):
         return None
     stop = stop_loss_price(limit, row["ATR"], params.atr_mult)
+    risk = limit - stop
+    take_profit = limit + (risk * 2)
     shares = calc_position_size(portfolio_value, limit, stop, params.risk_pct, params.max_cap_pct)
     shares = min(shares, math.floor(portfolio_value / (limit * (1 + params.commission_pct))))
     if shares <= 0 or not (0 < round(stop, 2) < round(limit, 2)):
         return None
-    return Order(created_date=finished.index[-1], limit_price=float(limit), stop_loss=float(stop), shares=shares)
+    return Order(
+        created_date=finished.index[-1],
+        limit_price=float(limit),
+        stop_loss=float(stop),
+        shares=shares,
+        take_profit_price=float(take_profit),
+    )
 
 
 def get_recent_orders(client: TradingClient, limit: int = 10) -> list[dict]:
@@ -121,6 +147,17 @@ def get_recent_orders(client: TradingClient, limit: int = 10) -> list[dict]:
         "status": order.status.value if hasattr(order.status, "value") else str(order.status),
         "submitted_at": str(order.submitted_at) if order.submitted_at else None,
         "filled_avg_price": str(order.filled_avg_price) if order.filled_avg_price is not None else None,
+        "limit_price": str(order.limit_price) if getattr(order, "limit_price", None) is not None else None,
+        "stop_loss_price": (
+            str(order.stop_loss.stop_price)
+            if getattr(order, "stop_loss", None) is not None and hasattr(order.stop_loss, "stop_price")
+            else str(order.stop_loss) if getattr(order, "stop_loss", None) is not None else None
+        ),
+        "take_profit_price": (
+            str(order.take_profit.limit_price)
+            if getattr(order, "take_profit", None) is not None and hasattr(order.take_profit, "limit_price")
+            else str(order.take_profit) if getattr(order, "take_profit", None) is not None else None
+        ),
     } for order in orders]
 
 
@@ -174,7 +211,6 @@ def _check_exit_once(client, symbol, position_state, params):
         position_state["day"] = day
         position_state["base"] = position_state["position"]
     base = position_state["base"]
-    if day <= base.entry_date.date(): return None
     updated, decision = evaluate_exit(
         base, float(current["Open"]), float(current["High"]), float(current["Low"]),
         float(current["Close"]), float(current["BB_mid"]), params.trailing_pct, params.time_stop,
@@ -232,7 +268,15 @@ async def run_live_loop(symbol="SPY", params=None, poll_seconds=60):
                         value = await asyncio.to_thread(get_account_value, client)
                         order = await asyncio.to_thread(run_signal_check, symbol, value, params)
                         if order:
-                            oid = await asyncio.to_thread(place_limit_buy, client, symbol, order.limit_price, order.shares, order.stop_loss)
+                            oid = await asyncio.to_thread(
+                                place_limit_buy,
+                                client,
+                                symbol,
+                                order.limit_price,
+                                order.shares,
+                                order.stop_loss,
+                                order.take_profit_price,
+                            )
                             LOG.info("Submitted paper buy %s for %s", oid, symbol)
                 if await asyncio.to_thread(has_open_position, client, symbol):
                     if "position" not in position_state:

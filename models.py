@@ -26,6 +26,7 @@ class Order:
     stop_loss: float
     shares: int
     side: str = "BUY"
+    take_profit_price: float | None = None
 
 
 @dataclass(frozen=True)

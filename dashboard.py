@@ -19,6 +19,22 @@ import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide
 
+
+def silent_auto_refresh(seconds: int = 15):
+    """Reload the page silently every N seconds so the dashboard stays live."""
+    st.components.v1.html(
+        f"""
+        <script>
+        const intervalMs = {seconds * 1000};
+        setInterval(() => {{
+            window.location.reload();
+        }}, intervalMs);
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
 BOT_DIR = Path(__file__).resolve().parent
 if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
