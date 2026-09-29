@@ -17,7 +17,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide
+from alpaca.trading.enums import OrderSide, QueryOrderStatus
+from alpaca.trading.requests import GetOrdersRequest
 
 
 BOT_DIR = Path(__file__).resolve().parent
@@ -41,6 +42,7 @@ WATCHLIST = {
     "Finance": ["JPM", "GS", "BRK-B", "V", "MA"],
 }
 ALL_SYMBOLS = [symbol for symbols in WATCHLIST.values() for symbol in symbols]
+CHART_SYMBOLS = list(dict.fromkeys([os.environ.get("TRADING_SYMBOL", "SPY"), *ALL_SYMBOLS]))
 REFRESH_SECONDS = 60
 REFRESH_WORKERS = 8
 APP_VERSION = os.environ.get("BOT_VERSION", "v2.1")
@@ -76,7 +78,7 @@ def to_alpaca_symbol(symbol: str) -> str:
 
 
 def fetch_ticker_data(symbol: str) -> dict:
-    frame = download_daily_bars(symbol, lookback_days=90, end=datetime.now(timezone.utc))
+    frame = download_daily_bars(symbol, lookback_days=400, end=datetime.now(timezone.utc))
     if frame.empty:
         raise ValueError(f"Nessuna barra Alpaca per {symbol}")
     frame = frame.copy()
@@ -85,6 +87,7 @@ def fetch_ticker_data(symbol: str) -> dict:
     data = prepare_data(frame)
     if data.empty:
         raise ValueError(f"Nessuna candela valida per {symbol}")
+    data["SMA_200"] = data["Close"].rolling(window=200, min_periods=200).mean()
     row = data.iloc[-1]
     values = {
         "price": float(row["Close"]),
@@ -92,6 +95,7 @@ def fetch_ticker_data(symbol: str) -> dict:
         "adx": float(row["ADX"]), "rsi": float(row["RSI"]),
         "bb_lower": float(row["BB_lower"]), "bb_mid": float(row["BB_mid"]), "bb_upper": float(row["BB_upper"]),
         "atr": float(row["ATR"]),
+        "chart_data": data.tail(260),
     }
     values["signal"] = compute_signal(values, PARAMS)
     return values
@@ -159,6 +163,134 @@ def backtest_table(results: dict[str, BacktestResult]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["Profilo", "Rendimento %", "Win rate %", "Max drawdown %", "N. trade"])
 
 
+def render_candlestick_chart(client, symbol: str, ticker_data: dict, params: StrategyParams) -> None:
+    data = ticker_data.get("chart_data")
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        st.info(f"Grafico di {symbol} in attesa delle barre Alpaca.")
+        return
+
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.78, 0.22],
+    )
+    figure.add_trace(
+        go.Candlestick(
+            x=data.index,
+            open=data["Open"],
+            high=data["High"],
+            low=data["Low"],
+            close=data["Close"],
+            name=symbol,
+        ),
+        row=1,
+        col=1,
+    )
+    for column, label, color in (
+        ("BB_upper", "Bollinger upper", "#d9822b"),
+        ("BB_mid", "Bollinger mid", "#687386"),
+        ("BB_lower", "Bollinger lower", "#d9822b"),
+    ):
+        figure.add_trace(
+            go.Scatter(x=data.index, y=data[column], name=label, line={"color": color, "width": 1}),
+            row=1,
+            col=1,
+        )
+    if params.bot_mode == "TREND_FOLLOWER" and data["SMA_200"].notna().any():
+        figure.add_trace(
+            go.Scatter(
+                x=data.index,
+                y=data["SMA_200"],
+                name="SMA 200",
+                line={"color": "#2878b5", "width": 1.5},
+            ),
+            row=1,
+            col=1,
+        )
+
+    figure.add_trace(
+        go.Bar(x=data.index, y=data["Volume"], name="Volume", marker_color="#91a3b0"),
+        row=2,
+        col=1,
+    )
+
+    if client is not None:
+        alpaca_symbol = to_alpaca_symbol(symbol)
+        try:
+            orders = client.get_orders(
+                filter=GetOrdersRequest(
+                    status=QueryOrderStatus.CLOSED,
+                    limit=500,
+                    nested=False,
+                    symbols=[alpaca_symbol],
+                    side=OrderSide.BUY,
+                )
+            )
+            entries = [
+                order for order in orders
+                if order.symbol == alpaca_symbol
+                and order.side == OrderSide.BUY
+                and order.filled_at is not None
+                and float(order.filled_qty or 0) > 0
+                and order.filled_avg_price is not None
+            ]
+            if entries:
+                figure.add_trace(
+                    go.Scatter(
+                        x=[order.filled_at for order in entries],
+                        y=[float(order.filled_avg_price) for order in entries],
+                        mode="markers",
+                        name="Entry eseguite",
+                        marker={"symbol": "triangle-up", "size": 11, "color": "#16834a"},
+                        customdata=[str(order.id) for order in entries],
+                        hovertemplate="Entry %{y:.2f}<br>%{x}<br>Ordine %{customdata}<extra></extra>",
+                    ),
+                    row=1,
+                    col=1,
+                )
+        except Exception as exc:
+            st.warning(f"Storico entry non disponibile per {symbol}: {exc}")
+
+        try:
+            stop_orders = [
+                order for order in _open_orders(client, alpaca_symbol)
+                if order.symbol == alpaca_symbol
+                and order.side == OrderSide.SELL
+                and getattr(order, "stop_price", None) is not None
+            ]
+            for index, order in enumerate(stop_orders):
+                figure.add_hline(
+                    y=float(order.stop_price),
+                    line_dash="dash",
+                    line_color="#c83232",
+                    annotation_text="Stop / trailing" if index == 0 else None,
+                    row=1,
+                    col=1,
+                )
+        except Exception as exc:
+            st.warning(f"Stop attivo non disponibile per {symbol}: {exc}")
+
+    figure.update_layout(
+        title=f"{symbol} · candele daily",
+        height=620,
+        autosize=True,
+        hovermode="x unified",
+        xaxis_rangeslider_visible=False,
+        legend={"orientation": "h", "y": 1.02, "x": 0},
+        margin={"l": 10, "r": 20, "t": 75, "b": 10},
+    )
+    figure.update_yaxes(title_text="Prezzo (USD)", row=1, col=1)
+    figure.update_yaxes(title_text="Volume", row=2, col=1)
+    st.plotly_chart(
+        figure,
+        use_container_width=True,
+        config={"responsive": True, "displaylogo": False},
+        key=f"candlestick_{symbol}",
+    )
+
+
 def _fetch_ticker_result(symbol: str) -> dict:
     try:
         return {**fetch_ticker_data(symbol), "last_updated": datetime.now()}
@@ -193,7 +325,7 @@ def render_refresh_controller(client, equity: float | None, positions: dict) -> 
     if "refresh_jobs" not in state:
         refresh_requested = state.pop("refresh_requested", False)
         if refresh_requested or (state.get("auto_refresh", True) and needs_refresh()):
-            start_ticker_refresh(state, ALL_SYMBOLS)
+            start_ticker_refresh(state, CHART_SYMBOLS)
 
     refresh_jobs = state.get("refresh_jobs")
     if refresh_jobs is not None:
@@ -215,7 +347,7 @@ def render_refresh_controller(client, equity: float | None, positions: dict) -> 
             st.rerun(scope="app")
 
         completed = state["refresh_completed"]
-        st.progress(completed / len(ALL_SYMBOLS), text=f"Aggiornamento dati in background: {completed}/{len(ALL_SYMBOLS)}")
+        st.progress(completed / len(CHART_SYMBOLS), text=f"Aggiornamento dati in background: {completed}/{len(CHART_SYMBOLS)}")
     else:
         last_refresh = state.get("last_refresh")
         if last_refresh:
@@ -755,7 +887,19 @@ def main() -> None:
     category_filter = controls[1].selectbox("Settore", ["Tutti", *WATCHLIST])
     controls[2].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
     controls[3].toggle("Auto-refresh", key="auto_refresh")
+    chart_symbol = st.selectbox(
+        "Grafico ticker",
+        CHART_SYMBOLS,
+        index=0,
+    )
     render_refresh_controller(client, equity, positions)
+    chart_params = get_ticker_params(chart_symbol)
+    render_candlestick_chart(
+        client,
+        chart_symbol,
+        st.session_state["live_data"].get(chart_symbol, {}),
+        chart_params,
+    )
     if any(st.session_state["bot_enabled"].values()):
         st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
 
