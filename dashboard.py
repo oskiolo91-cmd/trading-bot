@@ -5,9 +5,10 @@ from __future__ import annotations
 import math
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -15,50 +16,22 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide
 
-
-def silent_auto_refresh(seconds: int = 15):
-    """Trigger a silent Streamlit rerun every N seconds without a full page reload."""
-    st.components.v1.html(
-        f"""
-        <script>
-        const intervalMs = {seconds * 1000};
-        setInterval(() => {{
-            window.dispatchEvent(new Event("streamlit:rerun"));
-        }}, intervalMs);
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
 
 BOT_DIR = Path(__file__).resolve().parent
 if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
-from backtest import BacktestResult, load_ohlcv_csv, prepare_data, run_backtest
+from backtest import BacktestResult, download_daily_bars, prepare_data, run_backtest
 from models import StrategyParams
 from live_trader import (
     _check_exit_once, _initial_position, _open_orders, close_symbol_position,
     get_account_value, get_alpaca_client, get_symbol_daily_pnl,
-    get_latest_bars, get_recent_orders, place_limit_buy, place_market_sell, run_signal_check,
+    get_latest_bars, get_recent_orders, place_limit_buy, place_market_sell,
+    run_signal_check, start_trade_update_stream,
 )
-
-# Auto-download SPY data on first run
-try:
-    _data_path = BOT_DIR / "data" / "SPY.csv"
-    if not _data_path.exists():
-        _data_path.parent.mkdir(exist_ok=True)
-        _df = yf.download("SPY", start="2020-01-01", auto_adjust=False, progress=False)
-        _df.columns = [c[0] if isinstance(c, tuple) else c for c in _df.columns]
-        _df.index.name = "Date"
-        _df.reset_index().to_csv(_data_path, index=False)
-except Exception:
-    pass
-
 
 WATCHLIST = {
     "Big Tech": ["AAPL", "MSFT", "GOOGL", "NVDA", "META", "AMZN", "TSLA", "AMD", "INTC", "ORCL"],
@@ -103,11 +76,9 @@ def to_alpaca_symbol(symbol: str) -> str:
 
 
 def fetch_ticker_data(symbol: str) -> dict:
-    frame = yf.download(symbol, period="60d", interval="1d", auto_adjust=False, progress=False)
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
+    frame = download_daily_bars(symbol, lookback_days=90, end=datetime.now(timezone.utc))
     if frame.empty:
-        raise ValueError(f"Nessun dato da Yahoo Finance per {symbol}")
+        raise ValueError(f"Nessuna barra Alpaca per {symbol}")
     frame = frame.copy()
     # Orders are placed on the raw market tape, so indicators use unadjusted prices (as live_trader does).
     frame["Adj Close"] = frame["Close"]
@@ -157,11 +128,9 @@ def get_ticker_params(symbol: str, state=None) -> StrategyParams:
 
 def run_profile_backtest(symbol: str) -> dict[str, BacktestResult]:
     """Run backtest for all 3 preset profiles on 90 days of data."""
-    frame = yf.download(symbol, period=BACKTEST_PERIOD, interval="1d", auto_adjust=False, progress=False)
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
+    frame = download_daily_bars(symbol, lookback_days=90, end=datetime.now(timezone.utc))
     if frame.empty:
-        raise ValueError(f"Nessun dato da Yahoo Finance per {symbol}")
+        raise ValueError(f"Nessuna barra Alpaca per {symbol}")
     frame = frame.copy()
     frame["Adj Close"] = frame["Close"]
     data = prepare_data(frame)
@@ -216,6 +185,46 @@ def start_ticker_refresh(state, symbols: list[str]) -> None:
     }
     state["refresh_completed"] = 0
     state["refresh_errors"] = []
+
+
+@st.fragment(run_every="2s")
+def render_refresh_controller(client, equity: float | None, positions: dict) -> None:
+    state = st.session_state
+    if "refresh_jobs" not in state:
+        refresh_requested = state.pop("refresh_requested", False)
+        if refresh_requested or (state.get("auto_refresh", True) and needs_refresh()):
+            start_ticker_refresh(state, ALL_SYMBOLS)
+
+    refresh_jobs = state.get("refresh_jobs")
+    if refresh_jobs is not None:
+        for symbol, future in list(refresh_jobs.items()):
+            if not future.done():
+                continue
+            result = future.result()
+            state["live_data"][symbol] = result
+            if result.get("error"):
+                state["refresh_errors"].append(symbol)
+            del refresh_jobs[symbol]
+            state["refresh_completed"] += 1
+
+        if not refresh_jobs:
+            state.pop("refresh_jobs", None)
+            state["last_refresh"] = datetime.now()
+            if client is not None and equity is not None:
+                run_bot_cycle(client, state, positions, equity)
+            st.rerun(scope="app")
+
+        completed = state["refresh_completed"]
+        st.progress(completed / len(ALL_SYMBOLS), text=f"Aggiornamento dati in background: {completed}/{len(ALL_SYMBOLS)}")
+    else:
+        last_refresh = state.get("last_refresh")
+        if last_refresh:
+            st.caption(f"Ultimo aggiornamento dati: {last_refresh:%H:%M:%S}")
+        else:
+            st.caption("Primo aggiornamento dati in corso…")
+        refresh_errors = state.get("refresh_errors", [])
+        if refresh_errors:
+            st.warning(f"Dati non disponibili per {', '.join(refresh_errors)}.")
 
 
 def get_positions_map(client) -> dict:
@@ -368,7 +377,7 @@ def needs_refresh() -> bool:
 
 
 def _on_refresh_now() -> None:
-    st.session_state["last_refresh"] = None
+    st.session_state["refresh_requested"] = True
 
 
 def _on_toggle(symbol: str) -> None:
@@ -407,14 +416,17 @@ def _on_open_panel(symbol: str, kind: str, defaults: dict) -> None:
 def _on_submit_buy(client, symbol: str) -> None:
     limit = float(st.session_state[f"buy_limit_{symbol}"])
     stop = float(st.session_state[f"buy_stop_{symbol}"])
-    shares = float(st.session_state[f"buy_shares_{symbol}"])
+    budget = float(st.session_state[f"buy_budget_{symbol}"])
+    shares = round(budget / limit, 4) if limit > 0 else 0.0
     try:
+        if shares <= 0:
+            raise ValueError("Prezzo limite e budget devono essere positivi")
         order_id = place_limit_buy(client, to_alpaca_symbol(symbol), limit, shares, stop)
     except Exception as exc:
         st.session_state["panel_msg"][symbol] = ("error", f"Ordine non inviato: {exc}")
         return
     st.session_state["panels"].pop(symbol, None)
-    text = f"Ordine limite inviato: {shares:.4f} az. @ ${limit:,.2f} ~ stop ${stop:,.2f} (ID {order_id})"
+    text = f"Ordine limite inviato: ${budget:,.2f} ~ {shares:.4f} az. @ ${limit:,.2f}, stop ${stop:,.2f} (ID {order_id})"
     st.session_state["panel_msg"][symbol] = ("success", text)
     add_log(st.session_state, f"👤 {symbol}: {text}")
 
@@ -433,6 +445,17 @@ def _on_submit_sell(client, symbol: str) -> None:
     text = f"Vendita a mercato inviata: {shares:.4f} az. (ID {order_id})"
     st.session_state["panel_msg"][symbol] = ("success", text)
     add_log(st.session_state, f"👤 {symbol}: {text}")
+
+
+def _on_kill_symbol(client, symbol: str) -> None:
+    alpaca_symbol = to_alpaca_symbol(symbol)
+    try:
+        close_symbol_position(client, alpaca_symbol)
+        st.session_state["bot_enabled"][symbol] = False
+        st.session_state["bot_state"].pop(symbol, None)
+        add_log(st.session_state, f"🛑 {symbol}: KILL SIMBOLO, ordini annullati e posizione chiusa")
+    except Exception as exc:
+        add_log(st.session_state, f"🛑 {symbol}: KILL SIMBOLO fallito: {exc}")
 
 
 def _fmt(value: float, pattern: str = "{:,.2f}") -> str:
@@ -482,9 +505,10 @@ def render_buy_panel(client, symbol: str) -> None:
         cols = st.columns(3)
         cols[0].number_input("Prezzo limite ($)", min_value=0.0, step=0.01, key=f"buy_limit_{symbol}")
         cols[1].number_input("Stop loss ($)", min_value=0.0, step=0.01, key=f"buy_stop_{symbol}")
-        cols[2].number_input(
-            "Azioni", min_value=0.0001, step=0.0001, format="%.4f", key=f"buy_shares_{symbol}"
-        )
+        budget = cols[2].number_input("Budget (USD)", min_value=1.0, step=25.0, key=f"buy_budget_{symbol}")
+        limit = float(st.session_state.get(f"buy_limit_{symbol}", 0.0))
+        estimate = round(budget / limit, 4) if limit > 0 else 0.0
+        cols[2].caption(f"Quantità stimata: {estimate:.4f} az.")
         confirmed = st.checkbox("Confermo l'ordine", key=f"buy_confirm_{symbol}")
         st.button("Invia ordine", key=f"buy_submit_{symbol}", type="primary", disabled=not confirmed,
                   on_click=_on_submit_buy, args=(client, symbol))
@@ -500,6 +524,37 @@ def render_sell_panel(client, symbol: str, qty: float) -> None:
         st.caption("Gli stop-loss aperti su questo titolo verranno annullati prima della vendita.")
         st.button("Conferma vendita", key=f"sell_submit_{symbol}", type="primary",
                   on_click=_on_submit_sell, args=(client, symbol))
+
+
+def render_symbol_risk_status(client, symbol: str, data: dict, params: StrategyParams) -> None:
+    alpaca_symbol = to_alpaca_symbol(symbol)
+    pnl = get_symbol_daily_pnl(client, alpaca_symbol, commission_pct=params.commission_pct)
+    lower = -params.max_daily_drawdown_usd
+    upper = params.daily_target_usd
+    progress = min(1.0, max(0.0, (pnl - lower) / (upper - lower))) if upper > lower else 0.0
+    color = "#16834a" if pnl >= 0 else "#c83232"
+    st.markdown(
+        f'<div role="meter" aria-valuenow="{pnl:.2f}" aria-valuemin="{lower:.2f}" '
+        f'aria-valuemax="{upper:.2f}" aria-label="P&L realizzato giornaliero {symbol}" '
+        'style="height:8px;border-radius:4px;background:#e6e8eb;overflow:hidden">'
+        f'<div style="height:100%;width:{progress * 100:.2f}%;background:{color}"></div></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"P&L realizzato oggi: ${pnl:+.2f} ({lower:+.2f} / +{upper:.2f})")
+
+    price = data.get("price")
+    if params.bot_mode == "TREND_FOLLOWER" and isinstance(price, (int, float)) and price > 0:
+        stops = [
+            float(order.stop_price)
+            for order in _open_orders(client, alpaca_symbol)
+            if order.symbol == alpaca_symbol
+            and order.side == OrderSide.SELL
+            and getattr(order, "stop_price", None) is not None
+        ]
+        if stops:
+            stop_price = max(stops)
+            distance_pct = max(0.0, (price - stop_price) / price * 100)
+            st.caption(f"Rete di sicurezza: stop ${stop_price:.2f}, distanza {distance_pct:.2f}%")
 
 
 def render_custom_sliders(symbol: str) -> None:
@@ -601,16 +656,23 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
             qty = float(position.qty)
             st.button("Vendi", key=f"sell_{symbol}", disabled=not trading_ok, on_click=_on_open_panel,
                       args=(symbol, "sell", {f"sell_shares_{symbol}": max(0.0001, qty)}))
+            if trading_ok:
+                st.button("🛑 KILL SIMBOLO", key=f"kill_{symbol}", type="primary",
+                          on_click=_on_kill_symbol, args=(client, symbol))
+                render_symbol_risk_status(client, symbol, data, params)
         else:
             defaults = {}
             if trading_ok and "price" in data and math.isfinite(data["atr"]) and math.isfinite(data["bb_lower"]):
                 limit, stop, shares = order_plan(data, params)
                 target = limit + (data["atr"] * params.take_profit_atr_mult)
                 defaults = {f"buy_limit_{symbol}": max(0.0, limit), f"buy_stop_{symbol}": max(0.0, stop),
-                            f"buy_shares_{symbol}": shares, f"buy_confirm_{symbol}": False}
+                            f"buy_budget_{symbol}": params.trade_budget_usd, f"buy_confirm_{symbol}": False}
                 st.caption(f"🎯 Target ATR {params.take_profit_atr_mult:.1f}: ${target:,.2f}")
             st.button("Compra", key=f"buy_{symbol}", disabled=not defaults, on_click=_on_open_panel,
                       args=(symbol, "buy", defaults))
+            if trading_ok and st.session_state["bot_enabled"].get(symbol):
+                st.button("🛑 KILL SIMBOLO", key=f"kill_{symbol}", type="primary",
+                          on_click=_on_kill_symbol, args=(client, symbol))
         st.button("📊 Backtest", key=f"backtest_{symbol}", on_click=_on_toggle_backtest, args=(symbol,))
 
     if st.session_state["profile"].get(symbol) == CUSTOM_PROFILE:
@@ -676,48 +738,24 @@ def main() -> None:
 
     client, connect_error = connect_alpaca()
     equity, positions, account_error = load_account(client)
+    if client is not None:
+        key, secret, _ = _live_credentials()
+        if key and secret:
+            tracked_symbols = set(positions)
+            tracked_symbols.update(
+                to_alpaca_symbol(symbol)
+                for symbol, enabled in st.session_state["bot_enabled"].items()
+                if enabled
+            )
+            start_trade_update_stream(key, secret, client, sorted(tracked_symbols))
     render_header(client, account_error or connect_error, equity, positions)
 
     controls = st.columns([2, 1.3, 1, 1], vertical_alignment="center")
     search_query = controls[0].text_input("Cerca ticker", placeholder="Es. SPY, NVDA")
     category_filter = controls[1].selectbox("Settore", ["Tutti", *WATCHLIST])
-    refresh_requested = controls[2].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
-    auto_refresh = controls[3].toggle("Auto-refresh", key="auto_refresh")
-
-    refresh_jobs = st.session_state.get("refresh_jobs")
-    if refresh_jobs is not None:
-        for symbol, future in list(refresh_jobs.items()):
-            if not future.done():
-                continue
-            result = future.result()
-            st.session_state["live_data"][symbol] = result
-            if result.get("error"):
-                st.session_state["refresh_errors"].append(symbol)
-            del refresh_jobs[symbol]
-            st.session_state["refresh_completed"] += 1
-        if not refresh_jobs:
-            st.session_state.pop("refresh_jobs", None)
-            st.session_state["last_refresh"] = datetime.now()
-            if client is not None and equity is not None:
-                run_bot_cycle(client, st.session_state, positions, equity)
-
-    if "refresh_jobs" not in st.session_state and (refresh_requested or (auto_refresh and needs_refresh())):
-        start_ticker_refresh(st.session_state, ALL_SYMBOLS)
-        refresh_jobs = st.session_state["refresh_jobs"]
-
-    if auto_refresh or "refresh_jobs" in st.session_state:
-        silent_auto_refresh(seconds=15 if auto_refresh else 2)
-    if "refresh_jobs" in st.session_state:
-        completed = st.session_state["refresh_completed"]
-        st.progress(completed / len(ALL_SYMBOLS), text=f"Aggiornamento dati in background: {completed}/{len(ALL_SYMBOLS)}")
-    last_refresh = st.session_state.get("last_refresh")
-    if last_refresh:
-        st.caption(f"Ultimo aggiornamento dati: {last_refresh:%H:%M:%S}")
-    else:
-        st.caption("Primo aggiornamento dati in corso…")
-    refresh_errors = st.session_state.get("refresh_errors", [])
-    if refresh_errors:
-        st.warning(f"Dati non disponibili per {', '.join(refresh_errors)}.")
+    controls[2].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
+    controls[3].toggle("Auto-refresh", key="auto_refresh")
+    render_refresh_controller(client, equity, positions)
     if any(st.session_state["bot_enabled"].values()):
         st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
 

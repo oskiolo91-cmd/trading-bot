@@ -1,15 +1,15 @@
-"""Download SPY data on first run if not present."""
+"""Download SPY daily bars from Alpaca if the local CSV does not exist."""
+from datetime import datetime, timezone
 from pathlib import Path
-import yfinance as yf
+
+from backtest import download_daily_bars
 
 DATA_PATH = Path(__file__).parent / "data" / "SPY.csv"
 
 def ensure_spy_data():
     if DATA_PATH.exists(): return
     DATA_PATH.parent.mkdir(exist_ok=True)
-    df = yf.download("SPY", start="2020-01-01", auto_adjust=False)
-    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-    df.index.name = "Date"
+    df = download_daily_bars("SPY", lookback_days=3650, end=datetime.now(timezone.utc))
     df.reset_index().to_csv(DATA_PATH, index=False)
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from indicators import INDICATOR_COLUMNS, add_indicators
+from alpaca_data import fetch_daily_bars
 from macro_filter import is_risk_off_day
 from models import ExitDecision, ExitReason, Order, Position, StrategyParams
 from signals import entry_limit_price, evaluate_exit, limit_order_filled, stop_loss_price
@@ -35,6 +37,15 @@ class BacktestResult:
 def load_ohlcv_csv(path: str | Path) -> pd.DataFrame:
     """Load an OHLCV CSV with columns Date, Open, High, Low, Close, Adj Close, Volume."""
     return pd.read_csv(path)
+
+
+def download_daily_bars(symbol: str, lookback_days: int = 365, end: datetime | None = None) -> pd.DataFrame:
+    """Fetch raw daily bars from Alpaca for a historical simulation or indicator warmup."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive")
+    end_time = end or datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=lookback_days)
+    return fetch_daily_bars(symbol, start_time, end_time)[symbol]
 
 
 def sanitize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:

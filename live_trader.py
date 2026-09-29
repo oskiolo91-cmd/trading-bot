@@ -7,16 +7,19 @@ import logging
 import math
 import os
 import sys
-from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from threading import RLock, Thread
 from zoneinfo import ZoneInfo
 
 from alpaca.common.exceptions import APIError
+from alpaca.data.enums import DataFeed
+from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
-from alpaca.trading.models import TradeActivity
+from alpaca.trading.models import TradeActivity, TradeUpdate
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
@@ -25,21 +28,28 @@ from alpaca.trading.requests import (
     StopLossRequest,
     TakeProfitRequest,
 )
+from alpaca.trading.stream import TradingStream
 import pandas as pd
 from pydantic import TypeAdapter
-import yfinance as yf
 
 BOT_DIR = Path(__file__).resolve().parent
 if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
-from backtest import prepare_data
+from backtest import download_daily_bars, prepare_data
 from models import ExitDecision, ExitReason, Order, Position, StrategyParams, strategy_params_for_mode
+from pnl_manager import SymbolState
 from signals import entry_limit_price, evaluate_exit, stop_loss_price
 
 EASTERN = ZoneInfo("America/New_York")
 LOG = logging.getLogger(__name__)
 _ACTIVITY_CACHE: dict[int, tuple[datetime, list[TradeActivity]]] = {}
+_SYMBOL_STATES: dict[str, SymbolState] = {}
+_SYMBOL_STATE_LOCK = RLock()
+_TRADE_STREAM: TradingStream | None = None
+_TRADE_STREAM_THREAD: Thread | None = None
+_TRADE_STREAM_LOCK = RLock()
+_TRADE_UPDATE_HANDLERS: dict[str, list[Callable[[TradeUpdate, SymbolState], Awaitable[None]]]] = {}
 
 
 def get_alpaca_client() -> TradingClient:
@@ -81,7 +91,8 @@ def _get_trade_activities(client: TradingClient) -> list[TradeActivity]:
 
     activities: list[TradeActivity] = []
     page_token = None
-    while True:
+    has_more_pages = True
+    while has_more_pages:
         query = {"direction": "asc", "page_size": 100}
         if page_token:
             query["page_token"] = page_token
@@ -91,8 +102,9 @@ def _get_trade_activities(client: TradingClient) -> list[TradeActivity]:
             break
         activities.extend(page)
         if len(page) < 100:
-            break
-        page_token = str(page[-1].id)
+            has_more_pages = False
+        else:
+            page_token = str(page[-1].id)
 
     _ACTIVITY_CACHE[id(client)] = (now, activities)
     return activities
@@ -104,44 +116,112 @@ def get_symbol_daily_pnl(
     now: datetime | None = None,
     commission_pct: float = 0.0,
 ) -> float:
-    """Return today's realized FIFO P&L from fills for one symbol only."""
-    current_time = now or datetime.now(EASTERN)
-    if current_time.tzinfo is None:
-        current_time = current_time.replace(tzinfo=EASTERN)
-    today = current_time.astimezone(EASTERN).date()
-    lots: deque[list[float]] = deque()
-    realized_pnl = 0.0
+    """Return the SymbolState realized FIFO P&L for the current session day."""
+    state = get_symbol_state(client, symbol, commission_pct)
+    return float(state.daily_realized_pnl(now))
 
-    for activity in _get_trade_activities(client):
-        if activity.symbol != symbol:
-            continue
-        quantity = float(activity.qty)
-        price = float(activity.price)
-        side = getattr(activity.side, "value", activity.side)
-        if side == OrderSide.BUY.value:
-            lots.append([quantity, price])
-            continue
-        if side != OrderSide.SELL.value:
-            continue
 
-        fill_time = activity.transaction_time
-        if fill_time.tzinfo is None:
-            fill_time = fill_time.replace(tzinfo=timezone.utc)
-        is_today = fill_time.astimezone(EASTERN).date() == today
-        remaining = quantity
-        while remaining > 1e-8 and lots:
-            lot_quantity, entry_price = lots[0]
-            matched = min(remaining, lot_quantity)
-            if is_today:
-                realized_pnl += matched * (price - entry_price)
-                realized_pnl -= matched * (price + entry_price) * commission_pct
-            remaining -= matched
-            lot_quantity -= matched
-            if lot_quantity <= 1e-8:
-                lots.popleft()
-            else:
-                lots[0][0] = lot_quantity
-    return realized_pnl
+def get_symbol_state(
+    client: TradingClient,
+    symbol: str,
+    commission_pct: float = 0.001,
+) -> SymbolState:
+    """Create a per-symbol ledger and replay historical fills once on first access."""
+    with _SYMBOL_STATE_LOCK:
+        state = _SYMBOL_STATES.get(symbol)
+        if state is not None:
+            return state
+        state = SymbolState(symbol, commission_pct=commission_pct, timezone_=EASTERN)
+        activities = sorted(
+            (activity for activity in _get_trade_activities(client) if activity.symbol == symbol),
+            key=lambda activity: activity.transaction_time,
+        )
+        for activity in activities:
+            try:
+                state.record_fill(
+                    activity.side,
+                    activity.qty,
+                    activity.price,
+                    activity.transaction_time,
+                    execution_id=activity.id,
+                )
+            except ValueError:
+                LOG.warning("Unable to replay unmatched %s fill for %s", activity.side, symbol)
+        _SYMBOL_STATES[symbol] = state
+        return state
+
+
+def apply_trade_update(
+    client: TradingClient,
+    update: TradeUpdate,
+    commission_pct: float = 0.001,
+) -> SymbolState | None:
+    """Apply new or partial execution events to the matching symbol ledger."""
+    event = str(getattr(update.event, "value", update.event)).lower()
+    if event not in {"fill", "partial_fill"}:
+        return None
+    order = update.order
+    if update.qty is None or update.price is None:
+        LOG.warning("Fill update for %s has no incremental quantity or price", order.symbol)
+        return None
+    state = get_symbol_state(client, order.symbol, commission_pct)
+    execution_id = update.execution_id or (
+        f"{order.id}:{order.filled_qty}:{update.timestamp.isoformat()}"
+    )
+    state.record_fill(
+        order.side,
+        update.qty,
+        update.price,
+        update.timestamp,
+        execution_id=str(execution_id),
+    )
+    return state
+
+
+def register_trade_update_handler(
+    symbol: str,
+    handler: Callable[[TradeUpdate, SymbolState], Awaitable[None]],
+) -> None:
+    with _TRADE_STREAM_LOCK:
+        handlers = _TRADE_UPDATE_HANDLERS.setdefault(symbol, [])
+        if handler not in handlers:
+            handlers.append(handler)
+
+
+def start_trade_update_stream(
+    api_key: str,
+    secret_key: str,
+    client: TradingClient,
+    symbols: list[str],
+    commission_pct: float = 0.001,
+) -> None:
+    """Hydrate symbol ledgers, then listen for account fill events in one daemon thread."""
+    global _TRADE_STREAM, _TRADE_STREAM_THREAD
+    for symbol in symbols:
+        get_symbol_state(client, symbol, commission_pct)
+
+    with _TRADE_STREAM_LOCK:
+        if _TRADE_STREAM_THREAD is not None and _TRADE_STREAM_THREAD.is_alive():
+            return
+        stream = TradingStream(api_key, secret_key, paper=True)
+
+        async def handle_update(update: TradeUpdate) -> None:
+            try:
+                state = await asyncio.to_thread(apply_trade_update, client, update, commission_pct)
+                if state is None:
+                    return
+                with _TRADE_STREAM_LOCK:
+                    handlers = tuple(_TRADE_UPDATE_HANDLERS.get(update.order.symbol, ()))
+                for handler in handlers:
+                    await handler(update, state)
+            except Exception:
+                LOG.exception("Could not apply trade update for %s", update.order.symbol)
+
+        stream.subscribe_trade_updates(handle_update)
+        thread = Thread(target=stream.run, name="alpaca-trade-updates", daemon=True)
+        _TRADE_STREAM = stream
+        _TRADE_STREAM_THREAD = thread
+        thread.start()
 
 
 def get_open_position(client: TradingClient, symbol: str):
@@ -201,11 +281,9 @@ def place_market_sell(client: TradingClient, symbol: str, qty: float) -> str:
 def get_latest_bars(symbol: str, n: int = 60) -> pd.DataFrame:
     if n <= 0:
         raise ValueError("n must be positive")
-    frame = yf.download(symbol, period="2y", interval="1d", auto_adjust=False, progress=False)
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
+    frame = download_daily_bars(symbol, lookback_days=730)
     if frame.empty:
-        raise ValueError(f"No daily prices returned for {symbol}")
+        raise ValueError(f"No daily Alpaca bars returned for {symbol}")
     # Calculate the regime filter before truncating so its 200-bar history remains available.
     frame["SMA_200"] = frame["Close"].rolling(window=200, min_periods=200).mean()
     frame = frame.tail(n).copy()
@@ -390,129 +468,210 @@ def _check_exit_once(client, symbol, position_state, params):
     return decision
 
 
-async def run_exit_check(client, symbol, params=None, poll_seconds=60):
-    if params is None:
-        params = strategy_params_for_mode(os.environ.get("BOT_MODE", "TREND_FOLLOWER"))
-    if poll_seconds <= 0: raise ValueError("poll_seconds must be positive")
-    position_state: dict = {}
-    while True:
+class LiveTradingEngine:
+    """Event-driven single-symbol strategy runner backed by Alpaca WebSockets."""
+
+    def __init__(self, symbol: str, params: StrategyParams, client: TradingClient | None = None) -> None:
+        self.symbol = symbol
+        self.params = params
+        self.client = client or get_alpaca_client()
+        self.api_key = os.environ["ALPACA_API_KEY"]
+        self.secret_key = os.environ["ALPACA_SECRET_KEY"]
+        feed = DataFeed(os.environ.get("ALPACA_DATA_FEED", "iex").lower())
+        self.data_stream = StockDataStream(self.api_key, self.secret_key, feed=feed)
+        self.symbol_state = get_symbol_state(self.client, symbol, params.commission_pct)
+        self.position_state: dict = {}
+        self.runner_order_id: str | None = None
+        self.pending_entry_order_ids = {
+            str(order.id)
+            for order in _open_orders(self.client, self.symbol)
+            if order.symbol == self.symbol and order.side == OrderSide.BUY
+        }
+        self.halted_day = None
+        self.last_entry_day = None
+        self.clock = None
+        self._event_lock = asyncio.Lock()
+
+    def start(self) -> None:
+        self.data_stream.subscribe_daily_bars(self.on_daily_bar, self.symbol)
+        self.data_stream.subscribe_bars(self.on_minute_bar, self.symbol)
+        register_trade_update_handler(self.symbol, self.on_trade_update)
+        start_trade_update_stream(
+            self.api_key, self.secret_key, self.client, [self.symbol], self.params.commission_pct
+        )
+
+    @staticmethod
+    def _report_task(task: asyncio.Task) -> None:
         try:
-            clock = await asyncio.to_thread(client.get_clock)
-            if clock.is_open:
-                if not await asyncio.to_thread(has_open_position, client, symbol):
-                    position_state.clear()
-                else:
-                    if "position" not in position_state:
-                        p = await asyncio.to_thread(_initial_position, client, symbol)
-                        if p: position_state["position"] = p
-                    if "position" in position_state:
-                        d = await asyncio.to_thread(_check_exit_once, client, symbol, position_state, params)
-                        if d: LOG.info("Exit %s: %s", symbol, d.reason.value)
+            task.result()
+        except asyncio.CancelledError:
+            pass
         except Exception:
-            LOG.exception("Exit check failed; will retry")
-        await asyncio.sleep(poll_seconds)
+            LOG.exception("WebSocket strategy task failed")
+
+    def _schedule(self, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
+        task.add_done_callback(self._report_task)
+
+    async def on_daily_bar(self, bar) -> None:
+        if bar.symbol == self.symbol:
+            self._schedule(self._process_daily_bar(bar))
+
+    async def on_minute_bar(self, bar) -> None:
+        if bar.symbol == self.symbol:
+            self._schedule(self._process_minute_bar(bar))
+
+    async def on_trade_update(self, update: TradeUpdate, state: SymbolState) -> None:
+        if update.order.symbol != self.symbol:
+            return
+        async with self._event_lock:
+            try:
+                self._update_pending_entry_orders(update)
+                if state is self.symbol_state:
+                    await self._enforce_daily_limits(update.timestamp)
+            except Exception:
+                LOG.exception("Could not process %s trade update for %s", update.event, self.symbol)
+
+    def _update_pending_entry_orders(self, update: TradeUpdate) -> None:
+        if update.order.side != OrderSide.BUY:
+            return
+        order_id = str(update.order.id)
+        event = str(getattr(update.event, "value", update.event)).lower()
+        if event in {"new", "accepted", "pending_new", "partial_fill", "pending_replace", "replaced"}:
+            self.pending_entry_order_ids.add(order_id)
+        elif event in {"fill", "canceled", "expired", "rejected"}:
+            self.pending_entry_order_ids.discard(order_id)
+
+    async def _enforce_daily_limits(self, timestamp: datetime) -> bool:
+        day = timestamp.astimezone(EASTERN).date()
+        if self.halted_day == day:
+            return True
+        pnl = float(self.symbol_state.daily_realized_pnl(timestamp))
+        if pnl <= -self.params.max_daily_drawdown_usd or pnl >= self.params.daily_target_usd:
+            self.halted_day = day
+            await asyncio.to_thread(close_symbol_position, self.client, self.symbol)
+            self.pending_entry_order_ids.clear()
+            self.position_state.clear()
+            LOG.warning("Daily P&L limit reached for %s: $%.2f; bot halted for %s", self.symbol, pnl, day)
+            return True
+        return False
+
+    async def _process_daily_bar(self, bar) -> None:
+        async with self._event_lock:
+            await self._process_daily_bar_locked(bar)
+
+    async def _process_daily_bar_locked(self, bar) -> None:
+        day = bar.timestamp.astimezone(EASTERN).date()
+        if await self._enforce_daily_limits(bar.timestamp):
+            return
+        if self.halted_day is not None and self.halted_day != day:
+            self.halted_day = None
+        has_position = self.symbol_state.position_qty > 0
+        if has_position:
+            if "position" not in self.position_state:
+                position = await asyncio.to_thread(_initial_position, self.client, self.symbol)
+                if position is not None:
+                    self.position_state["position"] = position
+            if "position" in self.position_state:
+                self.position_state["runner_order_id"] = self.runner_order_id
+                decision = await asyncio.to_thread(
+                    _check_exit_once, self.client, self.symbol, self.position_state, self.params
+                )
+                if decision is not None:
+                    LOG.info("Exit %s: %s", self.symbol, decision.reason.value)
+            return
+
+        self.position_state.clear()
+
+    async def _submit_signal_order(self) -> None:
+        order = await asyncio.to_thread(run_signal_check, self.symbol, self.params)
+        if order is None:
+            return
+        bracket_id = await asyncio.to_thread(
+            place_limit_buy,
+            self.client,
+            self.symbol,
+            order.limit_price,
+            order.shares_1 or order.shares,
+            order.stop_loss,
+            order.take_profit_price,
+        )
+        runner_id = None
+        if order.shares_2:
+            runner_id = await asyncio.to_thread(
+                place_limit_buy,
+                self.client,
+                self.symbol,
+                order.limit_price,
+                order.shares_2,
+                order.stop_loss,
+            )
+        self.pending_entry_order_ids.add(bracket_id)
+        if runner_id:
+            self.pending_entry_order_ids.add(runner_id)
+        self.runner_order_id = runner_id
+        self.position_state["runner_order_id"] = runner_id
+        LOG.info("Submitted orders %s and %s for %s", bracket_id, runner_id, self.symbol)
+
+    async def _process_minute_bar(self, bar) -> None:
+        async with self._event_lock:
+            await self._process_minute_bar_locked(bar)
+
+    async def _process_minute_bar_locked(self, bar) -> None:
+        timestamp = bar.timestamp
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        day = timestamp.astimezone(EASTERN).date()
+        if self.halted_day == day:
+            return
+        clock_close = self.clock.next_close if self.clock is not None else None
+        if clock_close is not None and clock_close.tzinfo is None:
+            clock_close = clock_close.replace(tzinfo=timezone.utc)
+        if clock_close is None or clock_close.astimezone(EASTERN).date() != day:
+            self.clock = await asyncio.to_thread(self.client.get_clock)
+        if not self.clock.is_open:
+            return
+        next_close = self.clock.next_close
+        if next_close.tzinfo is None:
+            next_close = next_close.replace(tzinfo=timezone.utc)
+        minutes_to_close = (next_close - timestamp.astimezone(timezone.utc)).total_seconds() / 60
+        if self.params.bot_mode == "DAILY_SCALPER" and minutes_to_close <= 15:
+            self.halted_day = day
+            await asyncio.to_thread(close_symbol_position, self.client, self.symbol)
+            self.pending_entry_order_ids.clear()
+            self.position_state.clear()
+            LOG.info("Scalper closing-window lock for %s", self.symbol)
+            return
+
+        if self.params.bot_mode != "DAILY_SCALPER":
+            local_timestamp = timestamp.astimezone(EASTERN)
+            if local_timestamp.hour != 9 or local_timestamp.minute != 30:
+                return
+        if self.last_entry_day == day:
+            return
+        if self.symbol_state.position_qty > 0:
+            return
+        if self.pending_entry_order_ids:
+            return
+        self.last_entry_day = day
+        await self._submit_signal_order()
 
 
-async def run_live_loop(symbol: str | None = None, params=None, poll_seconds=60):
+def run_live_loop(symbol: str | None = None, params: StrategyParams | None = None) -> None:
+    """Run a single-symbol strategy from Alpaca market-data and trade-update streams."""
     symbol = symbol or os.environ.get("TRADING_SYMBOL", "SPY")
-    if params is None:
-        params = strategy_params_for_mode(os.environ.get("BOT_MODE", "TREND_FOLLOWER"))
-    if poll_seconds <= 0: raise ValueError("poll_seconds must be positive")
-    client = get_alpaca_client()
-    last_screen_day = None
-    position_state: dict = {}
-    runner_order_id = None
-    daily_state = {"day": None, "halted": False}
-    while True:
-        try:
-            clock = await asyncio.to_thread(client.get_clock)
-            if clock.is_open:
-                now = datetime.now(EASTERN)
-                if daily_state["day"] != now.date():
-                    daily_state.update(day=now.date(), halted=False)
-                if not daily_state["halted"]:
-                    daily_pnl = await asyncio.to_thread(
-                        get_symbol_daily_pnl, client, symbol, None, params.commission_pct
-                    )
-                    if daily_pnl <= -params.max_daily_drawdown_usd:
-                        await asyncio.to_thread(close_symbol_position, client, symbol)
-                        daily_state["halted"] = True
-                        position_state.clear()
-                        LOG.error(
-                            "Daily max drawdown reached for %s: P&L %.2f USD; symbol orders canceled, position closed, bot paused until tomorrow.",
-                            symbol, daily_pnl,
-                        )
-                    elif daily_pnl >= params.daily_target_usd:
-                        await asyncio.to_thread(close_symbol_position, client, symbol)
-                        daily_state["halted"] = True
-                        position_state.clear()
-                        LOG.info("Daily profit target reached for %s: P&L %.2f USD; paused until tomorrow.", symbol, daily_pnl)
-                    elif params.bot_mode == "DAILY_SCALPER":
-                        next_close = clock.next_close
-                        if next_close.tzinfo is None:
-                            next_close = next_close.replace(tzinfo=timezone.utc)
-                        minutes_to_close = (next_close - datetime.now(timezone.utc)).total_seconds() / 60
-                        if minutes_to_close <= 15:
-                            await asyncio.to_thread(close_symbol_position, client, symbol)
-                            daily_state["halted"] = True
-                            position_state.clear()
-                            LOG.info("Closing-window lock for %s: position closed within 15 minutes of market close.", symbol)
-                if daily_state["halted"]:
-                    LOG.debug("Daily risk lock active for %s; operational checks skipped.", now.date())
-                else:
-                    if now.hour == 9 and now.minute == 30 and last_screen_day != now.date():
-                        last_screen_day = now.date()
-                        if not await asyncio.to_thread(has_open_position, client, symbol) and not await asyncio.to_thread(_open_orders, client, symbol):
-                            order = await asyncio.to_thread(run_signal_check, symbol, params)
-                            if order:
-                                bracket_id = await asyncio.to_thread(
-                                    place_limit_buy,
-                                    client,
-                                    symbol,
-                                    order.limit_price,
-                                    order.shares_1 or order.shares,
-                                    order.stop_loss,
-                                    order.take_profit_price,
-                                )
-                                runner_id = None
-                                if order.shares_2:
-                                    runner_id = await asyncio.to_thread(
-                                        place_limit_buy,
-                                        client,
-                                        symbol,
-                                        order.limit_price,
-                                        order.shares_2,
-                                        order.stop_loss,
-                                    )
-                                position_state["runner_order_id"] = runner_id
-                                runner_order_id = runner_id
-                                LOG.info("Submitted scale-out orders %s and %s for %s", bracket_id, runner_id, symbol)
-                    if await asyncio.to_thread(has_open_position, client, symbol):
-                        if runner_order_id:
-                            position_state["runner_order_id"] = runner_order_id
-                        if "position" not in position_state:
-                            p = await asyncio.to_thread(_initial_position, client, symbol)
-                            if p: position_state["position"] = p
-                        if "position" in position_state:
-                            d = await asyncio.to_thread(_check_exit_once, client, symbol, position_state, params)
-                            if d: LOG.info("Exit %s: %s", symbol, d.reason.value)
-                    else:
-                        position_state.clear()
-            else:
-                LOG.debug("Market closed; next open: %s", clock.next_open)
-        except Exception:
-            LOG.exception("Live loop failed; will retry")
-        if daily_state["halted"]:
-            next_open = clock.next_open
-            if next_open.tzinfo is None:
-                next_open = next_open.replace(tzinfo=timezone.utc)
-            sleep_seconds = max(1, (next_open - datetime.now(timezone.utc)).total_seconds())
-        else:
-            now = datetime.now(EASTERN)
-            sleep_seconds = min(poll_seconds, max(1, 60 - now.second - now.microsecond / 1_000_000))
-        await asyncio.sleep(sleep_seconds)
+    params = params or strategy_params_for_mode(os.environ.get("BOT_MODE", "TREND_FOLLOWER"))
+    engine = LiveTradingEngine(symbol, params)
+    engine.start()
+    data_thread = Thread(target=engine.data_stream.run, name=f"alpaca-bars-{symbol}", daemon=True)
+    data_thread.start()
+    try:
+        data_thread.join()
+    except KeyboardInterrupt:
+        engine.data_stream.stop()
+        raise
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(run_live_loop(os.environ.get("TRADING_SYMBOL", "SPY"), strategy_params_for_mode(os.environ.get("BOT_MODE", "TREND_FOLLOWER"))))
+    run_live_loop()
