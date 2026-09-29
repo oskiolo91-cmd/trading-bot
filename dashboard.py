@@ -42,10 +42,10 @@ if str(BOT_DIR) not in sys.path:
 from backtest import BacktestResult, load_ohlcv_csv, prepare_data, run_backtest
 from models import StrategyParams
 from live_trader import (
-    _check_exit_once, _initial_position, _open_orders, get_account_value, get_alpaca_client,
+    _check_exit_once, _initial_position, _open_orders, close_symbol_position,
+    get_account_value, get_alpaca_client, get_symbol_daily_pnl,
     get_latest_bars, get_recent_orders, place_limit_buy, place_market_sell, run_signal_check,
 )
-from risk import calc_position_size
 
 # Auto-download SPY data on first run
 try:
@@ -73,9 +73,9 @@ LOG_LIMIT = 200
 ROW_WIDTHS = [1.6, 1, 1, 1.2, 1.5, 1.8]
 PARAMS = StrategyParams()
 PROFILES = {
-    "🐢 Conservativo": StrategyParams(adx_max=20, rsi_max=30, risk_pct=0.005, atr_mult=2.5, risk_reward=2.0, daily_target_pct=0.01),
-    "⚖️ Bilanciato": StrategyParams(adx_max=25, rsi_max=35, risk_pct=0.010, atr_mult=2.0, risk_reward=2.0, daily_target_pct=0.02),
-    "🚀 Speculativo": StrategyParams(adx_max=35, rsi_max=45, risk_pct=0.020, atr_mult=1.5, risk_reward=2.5, daily_target_pct=0.03),
+    "🐢 Conservativo": StrategyParams(adx_max=20, rsi_max=30, trade_budget_usd=50, stop_loss_atr_mult=2.5, take_profit_atr_mult=3.0, daily_target_usd=2.0),
+    "⚖️ Bilanciato": StrategyParams(adx_max=25, rsi_max=35, trade_budget_usd=100, stop_loss_atr_mult=2.0, take_profit_atr_mult=3.0, daily_target_usd=5.0),
+    "🚀 Speculativo": StrategyParams(adx_max=35, rsi_max=45, trade_budget_usd=200, stop_loss_atr_mult=1.5, take_profit_atr_mult=2.5, daily_target_usd=10.0),
     "🎛️ Custom": None,
 }
 PROFILE_NAMES = list(PROFILES.keys())
@@ -140,11 +140,11 @@ def get_ticker_params(symbol: str, state=None) -> StrategyParams:
         base,
         adx_max=float(state.get(f"custom_adx_{symbol}", base.adx_max)),
         rsi_max=float(state.get(f"custom_rsi_{symbol}", base.rsi_max)),
-        risk_pct=float(state.get(f"custom_risk_{symbol}", base.risk_pct * 100)) / 100,
-        atr_mult=float(state.get(f"custom_atr_{symbol}", base.atr_mult)),
-        risk_reward=float(state.get(f"custom_rr_{symbol}", base.risk_reward)),
-        daily_target_pct=float(state.get(f"custom_daily_target_{symbol}", base.daily_target_pct * 100)) / 100,
-        max_daily_drawdown_pct=float(state.get(f"custom_max_drawdown_{symbol}", base.max_daily_drawdown_pct * 100)) / 100,
+        trade_budget_usd=float(state.get(f"custom_budget_{symbol}", base.trade_budget_usd)),
+        stop_loss_atr_mult=float(state.get(f"custom_stop_atr_{symbol}", base.stop_loss_atr_mult)),
+        take_profit_atr_mult=float(state.get(f"custom_take_profit_atr_{symbol}", base.take_profit_atr_mult)),
+        daily_target_usd=float(state.get(f"custom_daily_target_{symbol}", base.daily_target_usd)),
+        max_daily_drawdown_usd=float(state.get(f"custom_max_drawdown_{symbol}", base.max_daily_drawdown_usd)),
     )
 
 
@@ -221,14 +221,12 @@ def connect_alpaca() -> tuple[object | None, str | None]:
         return None, f"Connessione ad Alpaca non riuscita: {exc}"
 
 
-def order_plan(data: dict, equity: float, params: StrategyParams) -> tuple[float, float, int]:
-    """Default limit (BB lower), stop (limit - atr_mult ATR) and share count for a buy."""
+def order_plan(data: dict, params: StrategyParams) -> tuple[float, float, float]:
+    """Return a fixed-budget fractional quantity, limit, and ATR stop."""
     limit = round(data["bb_lower"], 2)
-    stop = round(data["bb_lower"] - params.atr_mult * data["atr"], 2)
-    shares = calc_position_size(equity, limit, stop, params.risk_pct, params.max_cap_pct)
-    if limit > 0:
-        shares = min(shares, math.floor(equity / (limit * (1 + params.commission_pct))))
-    return limit, stop, max(0, shares)
+    stop = round(data["bb_lower"] - params.stop_loss_atr_mult * data["atr"], 2)
+    quantity = round(params.trade_budget_usd / limit, 4) if limit > 0 else 0.0
+    return limit, stop, quantity
 
 
 def add_log(state, message: str) -> None:
@@ -240,10 +238,10 @@ def add_log(state, message: str) -> None:
 def cancel_open_sells(client, alpaca_symbol: str, attempts: int = 10) -> None:
     """Protective stop legs lock the shares, so they must be cancelled before a market sell."""
     for order in _open_orders(client, alpaca_symbol):
-        if order.side == OrderSide.SELL:
+        if order.symbol == alpaca_symbol and order.side == OrderSide.SELL:
             client.cancel_order_by_id(order.id)
     for _ in range(attempts):
-        if not any(order.side == OrderSide.SELL for order in _open_orders(client, alpaca_symbol)):
+        if not any(order.symbol == alpaca_symbol and order.side == OrderSide.SELL for order in _open_orders(client, alpaca_symbol)):
             return
         time.sleep(0.5)
     raise RuntimeError("lo stop-loss non risulta ancora annullato, riprova tra qualche secondo")
@@ -258,39 +256,11 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
         add_log(state, f"🤖 Impossibile leggere l'orario di mercato: {exc}")
         return
     today = datetime.now(EASTERN).date()
-    daily_risk = state.setdefault(
-        "daily_risk",
-        {"day": None, "baseline_equity": None, "halted": False, "target_reached": False},
-    )
+    daily_risk = state.setdefault("daily_risk", {"day": None, "halted_symbols": {}})
+    daily_risk.setdefault("halted_symbols", {})
     if daily_risk["day"] != today:
-        daily_risk.update(day=today, baseline_equity=None, halted=False, target_reached=False)
-    if market_open and daily_risk["baseline_equity"] is None:
-        daily_risk["baseline_equity"] = float(equity)
-    if market_open and not daily_risk["halted"] and not daily_risk["target_reached"]:
-        drawdown_limit = min(
-            (get_ticker_params(symbol, state).max_daily_drawdown_pct for symbol in enabled),
-            default=StrategyParams().max_daily_drawdown_pct,
-        )
-        drawdown_floor = daily_risk["baseline_equity"] * (1 - drawdown_limit)
-        if equity <= drawdown_floor:
-            client.cancel_orders()
-            client.close_all_positions()
-            daily_risk["halted"] = True
-            state.setdefault("bot_state", {}).clear()
-            add_log(state, f"🛑 Drawdown giornaliero raggiunto ({equity:,.2f} <= {drawdown_floor:,.2f}); ordini annullati, posizioni chiuse, bot in pausa fino a domani")
-        else:
-            target_pct = min(
-                (get_ticker_params(symbol, state).daily_target_pct for symbol in enabled),
-                default=StrategyParams().daily_target_pct,
-            )
-            target_threshold = daily_risk["baseline_equity"] * (1 + target_pct)
-            if equity >= target_threshold:
-                client.cancel_orders()
-                client.close_all_positions()
-                daily_risk["target_reached"] = True
-                state.setdefault("bot_state", {}).clear()
-                add_log(state, f"🎯 Target giornaliero raggiunto ({equity:,.2f} >= {target_threshold:,.2f}); ordini annullati, posizioni chiuse, bot in pausa fino a domani")
-    if not market_open or daily_risk["halted"] or daily_risk["target_reached"] or not enabled:
+        daily_risk.update(day=today, halted_symbols={})
+    if not market_open or not enabled:
         return
     bot_state = state.setdefault("bot_state", {})
     last_buy = state.setdefault("bot_last_buy", {})
@@ -300,6 +270,16 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
         data = state.get("live_data", {}).get(symbol, {})
         params = get_ticker_params(symbol, state)
         try:
+            if daily_risk["halted_symbols"].get(symbol):
+                continue
+            daily_pnl = get_symbol_daily_pnl(client, alpaca_symbol, commission_pct=params.commission_pct)
+            if daily_pnl <= -params.max_daily_drawdown_usd or daily_pnl >= params.daily_target_usd:
+                close_symbol_position(client, alpaca_symbol)
+                daily_risk["halted_symbols"][symbol] = True
+                bot_state.pop(symbol, None)
+                reason = "drawdown" if daily_pnl < 0 else "target"
+                add_log(state, f"🤖 {symbol}: limite P&L giornaliero ({reason}) raggiunto: ${daily_pnl:,.2f}; ordini e posizione del solo simbolo chiusi")
+                continue
             if alpaca_symbol in positions:
                 if not market_open:
                     continue
@@ -323,19 +303,24 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
                 continue
             if any(order.side == OrderSide.BUY for order in _open_orders(client, alpaca_symbol)):
                 continue
-            limit, stop, shares = order_plan(data, equity, params)
+            limit, stop, shares = order_plan(data, params)
             last_buy[symbol] = today
             if shares <= 0 or not 0 < stop < limit:
                 add_log(state, f"🤖 {symbol}: segnale attivo ma ordine non dimensionabile")
                 continue
-            shares_1 = (shares + 1) // 2
-            shares_2 = shares // 2
-            risk_per_share = limit - stop
-            order_id = place_limit_buy(client, alpaca_symbol, limit, shares_1, stop, limit + risk_per_share * 1.5)
-            runner_id = place_limit_buy(client, alpaca_symbol, limit, shares_2, stop) if shares_2 else None
+            take_profit = limit + (float(data["atr"]) * params.take_profit_atr_mult)
+            if params.bot_mode == "TREND_FOLLOWER":
+                shares_1 = round(shares / 2, 4)
+                shares_2 = shares_1
+                order_id = place_limit_buy(client, alpaca_symbol, limit, shares_1, stop, take_profit)
+                runner_id = place_limit_buy(client, alpaca_symbol, limit, shares_2, stop)
+            else:
+                shares_1, shares_2 = shares, None
+                order_id = place_limit_buy(client, alpaca_symbol, limit, shares, stop, take_profit)
+                runner_id = None
             if runner_id:
                 runner_order_ids[symbol] = runner_id
-            add_log(state, f"🤖 {symbol}: scale-out {shares_1}+{shares_2} az. @ ${limit:,.2f}; target 1.5R, runner {runner_id or 'n/d'} (ID {order_id})")
+            add_log(state, f"🤖 {symbol}: {params.bot_mode} qty {shares_1}+{shares_2 or 0:.4f} @ ${limit:,.2f}; target ${take_profit:,.2f}, runner {runner_id or 'n/d'} (ID {order_id})")
         except Exception as exc:
             add_log(state, f"🤖 {symbol}: errore {exc}")
 
@@ -492,9 +477,11 @@ def render_sell_panel(client, symbol: str, qty: int) -> None:
 def render_custom_sliders(symbol: str) -> None:
     base = PROFILES[DEFAULT_PROFILE]
     defaults = {f"custom_adx_{symbol}": float(base.adx_max), f"custom_rsi_{symbol}": float(base.rsi_max),
-                f"custom_risk_{symbol}": base.risk_pct * 100, f"custom_atr_{symbol}": float(base.atr_mult),
-                f"custom_rr_{symbol}": float(base.risk_reward), f"custom_daily_target_{symbol}": base.daily_target_pct * 100,
-                f"custom_max_drawdown_{symbol}": base.max_daily_drawdown_pct * 100}
+                f"custom_budget_{symbol}": float(base.trade_budget_usd),
+                f"custom_stop_atr_{symbol}": float(base.stop_loss_atr_mult),
+                f"custom_take_profit_atr_{symbol}": float(base.take_profit_atr_mult),
+                f"custom_daily_target_{symbol}": float(base.daily_target_usd),
+                f"custom_max_drawdown_{symbol}": float(base.max_daily_drawdown_usd)}
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -503,11 +490,11 @@ def render_custom_sliders(symbol: str) -> None:
         cols = st.columns(7)
         cols[0].slider("ADX max", 15.0, 50.0, step=1.0, key=f"custom_adx_{symbol}")
         cols[1].slider("RSI max", 25.0, 60.0, step=1.0, key=f"custom_rsi_{symbol}")
-        cols[2].slider("Risk %", 0.1, 5.0, step=0.1, key=f"custom_risk_{symbol}")
-        cols[3].slider("Stop ATR mult", 1.0, 3.0, step=0.1, key=f"custom_atr_{symbol}")
-        cols[4].slider("Target RR", 1.0, 5.0, step=0.5, key=f"custom_rr_{symbol}")
-        cols[5].slider("Daily target %", 0.5, 10.0, step=0.5, key=f"custom_daily_target_{symbol}")
-        cols[6].slider("Max daily drawdown %", 0.5, 10.0, step=0.5, key=f"custom_max_drawdown_{symbol}")
+        cols[2].number_input("Budget $", min_value=1.0, step=25.0, key=f"custom_budget_{symbol}")
+        cols[3].slider("Stop ATR mult", 0.5, 4.0, step=0.1, key=f"custom_stop_atr_{symbol}")
+        cols[4].slider("Target ATR mult", 0.1, 5.0, step=0.1, key=f"custom_take_profit_atr_{symbol}")
+        cols[5].number_input("Daily target $", min_value=0.1, step=1.0, key=f"custom_daily_target_{symbol}")
+        cols[6].number_input("Daily loss cap $", min_value=0.1, step=1.0, key=f"custom_max_drawdown_{symbol}")
 
 
 def backtest_chart(table: pd.DataFrame) -> go.Figure:
@@ -589,11 +576,11 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
         else:
             defaults = {}
             if trading_ok and "price" in data and math.isfinite(data["atr"]) and math.isfinite(data["bb_lower"]):
-                limit, stop, shares = order_plan(data, equity, params)
-                target = limit + ((limit - stop) * params.risk_reward)
+                limit, stop, shares = order_plan(data, params)
+                target = limit + (data["atr"] * params.take_profit_atr_mult)
                 defaults = {f"buy_limit_{symbol}": max(0.0, limit), f"buy_stop_{symbol}": max(0.0, stop),
-                            f"buy_shares_{symbol}": shares, f"buy_confirm_{symbol}": False}
-                st.caption(f"🎯 Target RR {params.risk_reward:.1f}: ${target:,.2f}")
+                            f"buy_shares_{symbol}": max(1, math.floor(shares)), f"buy_confirm_{symbol}": False}
+                st.caption(f"🎯 Target ATR {params.take_profit_atr_mult:.1f}: ${target:,.2f}")
             st.button("Compra", key=f"buy_{symbol}", disabled=not defaults, on_click=_on_open_panel,
                       args=(symbol, "buy", defaults))
         st.button("📊 Backtest", key=f"backtest_{symbol}", on_click=_on_toggle_backtest, args=(symbol,))

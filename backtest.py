@@ -14,7 +14,6 @@ import pandas as pd
 from indicators import INDICATOR_COLUMNS, add_indicators
 from macro_filter import is_risk_off_day
 from models import ExitDecision, ExitReason, Order, Position, StrategyParams
-from risk import calc_position_size
 from signals import entry_limit_price, evaluate_exit, limit_order_filled, stop_loss_price
 
 OHLCV_COLUMNS: tuple[str, ...] = ("Open", "High", "Low", "Close", "Adj Close", "Volume")
@@ -170,10 +169,9 @@ def _maybe_place_order(row, day, next_day, cash, params, calendar, symbol):
     limit = entry_limit_price(row["Close"], row["BB_lower"], row["RSI"], row["ADX"], params.adx_max, params.rsi_max)
     if limit is None or not math.isfinite(row["ATR"]): return None
     if calendar and (is_risk_off_day(day, calendar, symbol) or is_risk_off_day(next_day, calendar, symbol)): return None
-    stop = stop_loss_price(limit, row["ATR"], params.atr_mult)
-    shares = calc_position_size(cash, limit, stop, params.risk_pct, params.max_cap_pct)
-    affordable = math.floor(cash / (limit * (1.0 + params.commission_pct)))
-    shares = min(shares, affordable)
+    stop = stop_loss_price(limit, row["ATR"], params.stop_loss_atr_mult)
+    budget = min(params.trade_budget_usd, cash)
+    shares = round(budget / (limit * (1.0 + params.commission_pct)), 4)
     if shares <= 0: return None
     return Order(created_date=day, limit_price=limit, stop_loss=stop, shares=shares)
 

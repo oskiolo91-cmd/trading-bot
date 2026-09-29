@@ -7,14 +7,16 @@ import logging
 import math
 import os
 import sys
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.models import TradeActivity
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
@@ -24,6 +26,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 import pandas as pd
+from pydantic import TypeAdapter
 import yfinance as yf
 
 BOT_DIR = Path(__file__).resolve().parent
@@ -31,12 +34,12 @@ if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 from backtest import prepare_data
-from models import ExitDecision, ExitReason, Order, Position, StrategyParams
-from risk import calc_position_size
+from models import ExitDecision, ExitReason, Order, Position, StrategyParams, strategy_params_for_mode
 from signals import entry_limit_price, evaluate_exit, stop_loss_price
 
 EASTERN = ZoneInfo("America/New_York")
 LOG = logging.getLogger(__name__)
+_ACTIVITY_CACHE: dict[int, tuple[datetime, list[TradeActivity]]] = {}
 
 
 def get_alpaca_client() -> TradingClient:
@@ -50,26 +53,95 @@ def get_account_value(client: TradingClient) -> float:
     return float(client.get_account().equity)
 
 
-def close_all_positions(client: TradingClient) -> bool:
-    """Close every open long position when the daily profit target is reached."""
-    positions = client.get_all_positions()
-    if not positions:
-        return False
-
-    for position in positions:
-        if float(position.qty) <= 0:
-            continue
-        for order in _open_orders(client, position.symbol):
-            if order.side == OrderSide.SELL:
+def cancel_symbol_orders(client: TradingClient, symbol: str) -> None:
+    """Cancel open orders for one symbol without touching other strategies."""
+    for order in _open_orders(client, symbol):
+        if order.symbol == symbol:
+            try:
                 client.cancel_order_by_id(order.id)
+            except APIError as exc:
+                if exc.status_code not in {404, 422}:
+                    raise
 
-    closed = []
-    for position in client.get_all_positions():
-        if float(position.qty) <= 0:
+
+def close_symbol_position(client: TradingClient, symbol: str) -> bool:
+    """Cancel this symbol's orders and close only this symbol's position."""
+    cancel_symbol_orders(client, symbol)
+    if not has_open_position(client, symbol):
+        return False
+    client.close_position(symbol)
+    return True
+
+
+def _get_trade_activities(client: TradingClient) -> list[TradeActivity]:
+    now = datetime.now(timezone.utc)
+    cached = _ACTIVITY_CACHE.get(id(client))
+    if cached and now - cached[0] < timedelta(seconds=30):
+        return cached[1]
+
+    activities: list[TradeActivity] = []
+    page_token = None
+    while True:
+        query = {"direction": "asc", "page_size": 100}
+        if page_token:
+            query["page_token"] = page_token
+        response = client.get("/account/activities/FILL", query)
+        page = TypeAdapter(list[TradeActivity]).validate_python(response)
+        if not page:
+            break
+        activities.extend(page)
+        if len(page) < 100:
+            break
+        page_token = str(page[-1].id)
+
+    _ACTIVITY_CACHE[id(client)] = (now, activities)
+    return activities
+
+
+def get_symbol_daily_pnl(
+    client: TradingClient,
+    symbol: str,
+    now: datetime | None = None,
+    commission_pct: float = 0.0,
+) -> float:
+    """Return today's realized FIFO P&L from fills for one symbol only."""
+    current_time = now or datetime.now(EASTERN)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=EASTERN)
+    today = current_time.astimezone(EASTERN).date()
+    lots: deque[list[float]] = deque()
+    realized_pnl = 0.0
+
+    for activity in _get_trade_activities(client):
+        if activity.symbol != symbol:
             continue
-        sell_id = place_market_sell(client, position.symbol, int(float(position.qty)))
-        closed.append(sell_id)
-    return bool(closed)
+        quantity = float(activity.qty)
+        price = float(activity.price)
+        side = getattr(activity.side, "value", activity.side)
+        if side == OrderSide.BUY.value:
+            lots.append([quantity, price])
+            continue
+        if side != OrderSide.SELL.value:
+            continue
+
+        fill_time = activity.transaction_time
+        if fill_time.tzinfo is None:
+            fill_time = fill_time.replace(tzinfo=timezone.utc)
+        is_today = fill_time.astimezone(EASTERN).date() == today
+        remaining = quantity
+        while remaining > 1e-8 and lots:
+            lot_quantity, entry_price = lots[0]
+            matched = min(remaining, lot_quantity)
+            if is_today:
+                realized_pnl += matched * (price - entry_price)
+                realized_pnl -= matched * (price + entry_price) * commission_pct
+            remaining -= matched
+            lot_quantity -= matched
+            if lot_quantity <= 1e-8:
+                lots.popleft()
+            else:
+                lots[0][0] = lot_quantity
+    return realized_pnl
 
 
 def get_open_position(client: TradingClient, symbol: str):
@@ -90,11 +162,11 @@ def place_limit_buy(
     client: TradingClient,
     symbol: str,
     limit_price: float,
-    shares: int,
+    qty: float,
     stop_loss_price: float,
     take_profit_price: float = None,
 ) -> str:
-    if not (math.isfinite(limit_price) and math.isfinite(stop_loss_price)) or not (0 < stop_loss_price < limit_price) or shares <= 0:
+    if not (math.isfinite(limit_price) and math.isfinite(stop_loss_price) and math.isfinite(qty)) or not (0 < stop_loss_price < limit_price) or qty <= 0:
         raise ValueError("Invalid buy order price, stop or share count")
     limit = round(limit_price, 2)
     stop = round(stop_loss_price, 2)
@@ -105,24 +177,24 @@ def place_limit_buy(
         if not math.isfinite(take_profit_price) or take_profit_price <= limit:
             raise ValueError("Invalid take profit price")
         request = LimitOrderRequest(
-            symbol=symbol, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+            symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
             limit_price=limit, order_class=OrderClass.BRACKET,
             take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
             stop_loss=StopLossRequest(stop_price=stop),
         )
     else:
         request = LimitOrderRequest(
-            symbol=symbol, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+            symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
             limit_price=limit, order_class=OrderClass.OTO,
             take_profit=None, stop_loss=StopLossRequest(stop_price=stop),
         )
     return str(client.submit_order(order_data=request).id)
 
 
-def place_market_sell(client: TradingClient, symbol: str, shares: int) -> str:
-    if shares <= 0:
-        raise ValueError("Shares must be positive")
-    request = MarketOrderRequest(symbol=symbol, qty=shares, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+def place_market_sell(client: TradingClient, symbol: str, qty: float) -> str:
+    if not math.isfinite(qty) or qty <= 0:
+        raise ValueError("Quantity must be positive")
+    request = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
     return str(client.submit_order(order_data=request).id)
 
 
@@ -141,7 +213,9 @@ def get_latest_bars(symbol: str, n: int = 60) -> pd.DataFrame:
     return frame[["Open", "High", "Low", "Close", "Adj Close", "Volume", "SMA_200"]]
 
 
-def run_signal_check(symbol: str = "SPY", portfolio_value: float = 100_000.0, params: StrategyParams = StrategyParams()) -> Order | None:
+def run_signal_check(symbol: str = "SPY", params: StrategyParams | None = None) -> Order | None:
+    if params is None:
+        params = strategy_params_for_mode(os.environ.get("BOT_MODE", "TREND_FOLLOWER"))
     bars = get_latest_bars(symbol)
     data = prepare_data(bars)
     data["SMA_200"] = bars["SMA_200"].reindex(data.index)
@@ -150,27 +224,30 @@ def run_signal_check(symbol: str = "SPY", portfolio_value: float = 100_000.0, pa
     if finished.empty:
         return None
     row = finished.iloc[-1]
-    if not math.isfinite(float(row["SMA_200"])) or float(row["Raw Close"]) < float(row["SMA_200"]):
+    if params.bot_mode == "TREND_FOLLOWER" and (
+        not math.isfinite(float(row["SMA_200"])) or float(row["Raw Close"]) <= float(row["SMA_200"])
+    ):
         return None
     limit = entry_limit_price(row["Close"], row["BB_lower"], row["RSI"], row["ADX"], params.adx_max, params.rsi_max)
     if limit is None or not math.isfinite(row["ATR"]):
         return None
-    stop = stop_loss_price(limit, row["ATR"], params.atr_mult)
-    risk = limit - stop
-    take_profit = limit + (risk * params.risk_reward)
-    shares = calc_position_size(portfolio_value, limit, stop, params.risk_pct, params.max_cap_pct)
-    shares = min(shares, math.floor(portfolio_value / (limit * (1 + params.commission_pct))))
-    if shares <= 0 or not (0 < round(stop, 2) < round(limit, 2)):
+    stop = stop_loss_price(limit, row["ATR"], params.stop_loss_atr_mult)
+    fractional_qty = round(params.trade_budget_usd / limit, 4)
+    take_profit = limit + (float(row["ATR"]) * params.take_profit_atr_mult)
+    if fractional_qty <= 0 or not (0 < round(stop, 2) < round(limit, 2)):
         return None
-    # Split size into a profit-taking tranche and a smaller runner tranche.
-    shares_1 = (shares + 1) // 2
-    shares_2 = shares // 2
+    if params.bot_mode == "TREND_FOLLOWER":
+        shares_1 = round(fractional_qty / 2, 4)
+        shares_2 = shares_1
+    else:
+        shares_1 = fractional_qty
+        shares_2 = None
     return Order(
         created_date=finished.index[-1],
         limit_price=float(limit),
         stop_loss=float(stop),
-        shares=shares,
-        take_profit_price=float(limit + (risk * 1.5)),
+        shares=fractional_qty,
+        take_profit_price=float(take_profit),
         shares_1=shares_1,
         shares_2=shares_2,
     )
@@ -229,7 +306,7 @@ def _initial_position(client: TradingClient, symbol: str) -> Position | None:
     buys = [order for order in filled if order.symbol == symbol and order.side == OrderSide.BUY and getattr(order, "filled_at", None)]
     entry_date = pd.Timestamp(max(buys, key=lambda order: order.filled_at).filled_at) if buys else pd.Timestamp.now(tz=EASTERN)
     return Position(entry_date=entry_date, entry_price=price, stop_loss=float(stops[0].stop_price),
-                    shares=int(float(position.qty)), entry_commission=0.0, peak_price=price)
+                    shares=float(position.qty), entry_commission=0.0, peak_price=price)
 
 
 def _runner_stop_order(client: TradingClient, symbol: str, runner_order_id: str | None):
@@ -289,7 +366,7 @@ def _check_exit_once(client, symbol, position_state, params):
             break_even_trigger = entry_price + (entry_price - initial_stop)
             if current_price >= break_even_trigger:
                 next_stop = max(next_stop, entry_price)
-                atr_stop = current_price - (float(current["ATR"]) * params.atr_mult)
+                atr_stop = current_price - (float(current["ATR"]) * params.stop_loss_atr_mult)
                 next_stop = max(next_stop, atr_stop)
             rounded_stop = round(next_stop, 2)
             if rounded_stop > current_stop and rounded_stop < current_price:
@@ -302,18 +379,20 @@ def _check_exit_once(client, symbol, position_state, params):
         position_state["position"] = updated; return None
     if decision.reason is ExitReason.STOP_LOSS: return decision
     for order in _open_orders(client, symbol):
-        if order.side == OrderSide.SELL: client.cancel_order_by_id(order.id)
-    if any(o.side == OrderSide.SELL for o in _open_orders(client, symbol)): return None
+        if order.symbol == symbol and order.side == OrderSide.SELL:
+            client.cancel_order_by_id(order.id)
+    if any(o.symbol == symbol and o.side == OrderSide.SELL for o in _open_orders(client, symbol)): return None
     pos = get_open_position(client, symbol)
     if pos is None: position_state.clear(); return None
-    sell_id = place_market_sell(client, symbol, int(float(pos.qty)))
+    sell_id = place_market_sell(client, symbol, float(pos.qty))
     position_state["pending_exit"] = sell_id
     position_state["position"] = updated
     return decision
 
 
 async def run_exit_check(client, symbol, params=None, poll_seconds=60):
-    if params is None: params = StrategyParams()
+    if params is None:
+        params = strategy_params_for_mode(os.environ.get("BOT_MODE", "TREND_FOLLOWER"))
     if poll_seconds <= 0: raise ValueError("poll_seconds must be positive")
     position_state: dict = {}
     while True:
@@ -334,57 +413,57 @@ async def run_exit_check(client, symbol, params=None, poll_seconds=60):
         await asyncio.sleep(poll_seconds)
 
 
-async def run_live_loop(symbol="SPY", params=None, poll_seconds=60):
-    if params is None: params = StrategyParams()
+async def run_live_loop(symbol: str | None = None, params=None, poll_seconds=60):
+    symbol = symbol or os.environ.get("TRADING_SYMBOL", "SPY")
+    if params is None:
+        params = strategy_params_for_mode(os.environ.get("BOT_MODE", "TREND_FOLLOWER"))
     if poll_seconds <= 0: raise ValueError("poll_seconds must be positive")
     client = get_alpaca_client()
     last_screen_day = None
     position_state: dict = {}
     runner_order_id = None
-    daily_state = {"day": None, "baseline_equity": None, "halted": False, "target_reached": False}
+    daily_state = {"day": None, "halted": False}
     while True:
         try:
             clock = await asyncio.to_thread(client.get_clock)
             if clock.is_open:
                 now = datetime.now(EASTERN)
                 if daily_state["day"] != now.date():
-                    daily_state.update(day=now.date(), baseline_equity=None, halted=False, target_reached=False)
-                if daily_state["baseline_equity"] is None:
-                    daily_state["baseline_equity"] = await asyncio.to_thread(get_account_value, client)
+                    daily_state.update(day=now.date(), halted=False)
                 if not daily_state["halted"]:
-                    current_value = await asyncio.to_thread(get_account_value, client)
-                    drawdown_floor = daily_state["baseline_equity"] * (1 - params.max_daily_drawdown_pct)
-                    if current_value <= drawdown_floor:
-                        await asyncio.to_thread(client.cancel_orders)
-                        await asyncio.to_thread(client.close_all_positions)
+                    daily_pnl = await asyncio.to_thread(
+                        get_symbol_daily_pnl, client, symbol, None, params.commission_pct
+                    )
+                    if daily_pnl <= -params.max_daily_drawdown_usd:
+                        await asyncio.to_thread(close_symbol_position, client, symbol)
                         daily_state["halted"] = True
                         position_state.clear()
                         LOG.error(
-                            "Daily max drawdown reached: %.2f <= %.2f; orders canceled, positions closed, bot paused until tomorrow.",
-                            current_value,
-                            drawdown_floor,
+                            "Daily max drawdown reached for %s: P&L %.2f USD; symbol orders canceled, position closed, bot paused until tomorrow.",
+                            symbol, daily_pnl,
                         )
-                    elif not daily_state["target_reached"]:
-                        target_threshold = daily_state["baseline_equity"] * (1 + params.daily_target_pct)
-                        if current_value >= target_threshold:
-                            await asyncio.to_thread(client.cancel_orders)
-                            await asyncio.to_thread(client.close_all_positions)
-                            daily_state["target_reached"] = True
-                            LOG.info(
-                                "Daily profit target reached: %.2f >= %.2f; orders canceled and positions closed.",
-                                current_value,
-                                target_threshold,
-                            )
+                    elif daily_pnl >= params.daily_target_usd:
+                        await asyncio.to_thread(close_symbol_position, client, symbol)
+                        daily_state["halted"] = True
+                        position_state.clear()
+                        LOG.info("Daily profit target reached for %s: P&L %.2f USD; paused until tomorrow.", symbol, daily_pnl)
+                    elif params.bot_mode == "DAILY_SCALPER":
+                        next_close = clock.next_close
+                        if next_close.tzinfo is None:
+                            next_close = next_close.replace(tzinfo=timezone.utc)
+                        minutes_to_close = (next_close - datetime.now(timezone.utc)).total_seconds() / 60
+                        if minutes_to_close <= 15:
+                            await asyncio.to_thread(close_symbol_position, client, symbol)
+                            daily_state["halted"] = True
+                            position_state.clear()
+                            LOG.info("Closing-window lock for %s: position closed within 15 minutes of market close.", symbol)
                 if daily_state["halted"]:
                     LOG.debug("Daily risk lock active for %s; operational checks skipped.", now.date())
-                elif daily_state["target_reached"]:
-                    LOG.debug("Daily profit target active for %s; operational checks skipped.", now.date())
                 else:
                     if now.hour == 9 and now.minute == 30 and last_screen_day != now.date():
                         last_screen_day = now.date()
                         if not await asyncio.to_thread(has_open_position, client, symbol) and not await asyncio.to_thread(_open_orders, client, symbol):
-                            value = await asyncio.to_thread(get_account_value, client)
-                            order = await asyncio.to_thread(run_signal_check, symbol, value, params)
+                            order = await asyncio.to_thread(run_signal_check, symbol, params)
                             if order:
                                 bracket_id = await asyncio.to_thread(
                                     place_limit_buy,
@@ -423,10 +502,17 @@ async def run_live_loop(symbol="SPY", params=None, poll_seconds=60):
                 LOG.debug("Market closed; next open: %s", clock.next_open)
         except Exception:
             LOG.exception("Live loop failed; will retry")
-        now = datetime.now(EASTERN)
-        await asyncio.sleep(min(poll_seconds, max(1, 60 - now.second - now.microsecond / 1_000_000)))
+        if daily_state["halted"]:
+            next_open = clock.next_open
+            if next_open.tzinfo is None:
+                next_open = next_open.replace(tzinfo=timezone.utc)
+            sleep_seconds = max(1, (next_open - datetime.now(timezone.utc)).total_seconds())
+        else:
+            now = datetime.now(EASTERN)
+            sleep_seconds = min(poll_seconds, max(1, 60 - now.second - now.microsecond / 1_000_000))
+        await asyncio.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(run_live_loop(os.environ.get("TRADING_SYMBOL", "SPY")))
+    asyncio.run(run_live_loop(os.environ.get("TRADING_SYMBOL", "SPY"), strategy_params_for_mode(os.environ.get("BOT_MODE", "TREND_FOLLOWER"))))

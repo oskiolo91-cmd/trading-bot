@@ -24,11 +24,11 @@ class Order:
     created_date: pd.Timestamp
     limit_price: float
     stop_loss: float
-    shares: int
+    shares: float
     side: str = "BUY"
     take_profit_price: float | None = None
-    shares_1: int | None = None
-    shares_2: int | None = None
+    shares_1: float | None = None
+    shares_2: float | None = None
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,7 @@ class Position:
     entry_date: pd.Timestamp
     entry_price: float
     stop_loss: float
-    shares: int
+    shares: float
     entry_commission: float
     peak_price: float
     trailing_active: bool = False
@@ -57,14 +57,36 @@ class ExitDecision:
 class StrategyParams:
     """All tunable strategy / execution parameters in one place."""
 
-    risk_pct: float = 0.01
-    max_cap_pct: float = 0.10
+    bot_mode: str = "TREND_FOLLOWER"
+    trade_budget_usd: float = 100.0
     commission_pct: float = 0.001
     trailing_pct: float = 0.03
     time_stop: int = 10
-    atr_mult: float = 2.0
+    stop_loss_atr_mult: float = 2.0
+    take_profit_atr_mult: float = 3.0
     adx_max: float = 25.0
     rsi_max: float = 35.0
-    risk_reward: float = 2.0
-    daily_target_pct: float = 0.02
-    max_daily_drawdown_pct: float = 0.02
+    daily_target_usd: float = 10.0
+    max_daily_drawdown_usd: float = 5.0
+
+
+def strategy_params_for_mode(mode: str) -> StrategyParams:
+    """Build the fixed-budget defaults for one supported live strategy."""
+    normalized_mode = mode.strip().upper()
+    if normalized_mode == "TREND_FOLLOWER":
+        return StrategyParams(
+            bot_mode=normalized_mode,
+            stop_loss_atr_mult=2.0,
+            take_profit_atr_mult=3.0,
+            daily_target_usd=10.0,
+            max_daily_drawdown_usd=5.0,
+        )
+    if normalized_mode == "DAILY_SCALPER":
+        return StrategyParams(
+            bot_mode=normalized_mode,
+            stop_loss_atr_mult=1.0,
+            take_profit_atr_mult=0.5,
+            daily_target_usd=5.0,
+            max_daily_drawdown_usd=5.0,
+        )
+    raise ValueError("BOT_MODE must be TREND_FOLLOWER or DAILY_SCALPER")

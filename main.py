@@ -40,12 +40,12 @@ def parse_args(argv=None):
     defaults = StrategyParams()
     p = argparse.ArgumentParser(description="Walk-forward backtest: range trading + trailing stop")
     p.add_argument("--csv", default=None)
-    p.add_argument("--risk", type=float, default=defaults.risk_pct)
-    p.add_argument("--max-cap", type=float, default=defaults.max_cap_pct)
+    p.add_argument("--trade-budget", type=float, default=defaults.trade_budget_usd)
     p.add_argument("--trailing-pct", type=float, default=defaults.trailing_pct)
     p.add_argument("--commission", type=float, default=defaults.commission_pct)
     p.add_argument("--time-stop", type=int, default=defaults.time_stop)
-    p.add_argument("--atr-mult", type=float, default=defaults.atr_mult)
+    p.add_argument("--stop-loss-atr-mult", type=float, default=defaults.stop_loss_atr_mult)
+    p.add_argument("--take-profit-atr-mult", type=float, default=defaults.take_profit_atr_mult)
     p.add_argument("--portfolio", type=float, default=100_000.0)
     p.add_argument("--in-sample-pct", type=float, default=0.7)
     p.add_argument("--calendar", default=None)
@@ -94,7 +94,14 @@ def main(argv=None):
         raw, symbol = generate_synthetic_ohlcv(rows=args.rows, seed=args.seed), None
         print(f"No --csv given: generated {len(raw)} synthetic OHLCV rows (seed={args.seed})")
     calendar = load_calendar(args.calendar) if args.calendar else None
-    params = StrategyParams(risk_pct=args.risk, max_cap_pct=args.max_cap, commission_pct=args.commission, trailing_pct=args.trailing_pct, time_stop=args.time_stop, atr_mult=args.atr_mult)
+    params = StrategyParams(
+        trade_budget_usd=args.trade_budget,
+        commission_pct=args.commission,
+        trailing_pct=args.trailing_pct,
+        time_stop=args.time_stop,
+        stop_loss_atr_mult=args.stop_loss_atr_mult,
+        take_profit_atr_mult=args.take_profit_atr_mult,
+    )
     result = run_walk_forward(raw, params, args.portfolio, args.in_sample_pct, calendar, symbol)
     print(format_summary(result))
     trades_path, metrics_path = save_outputs(result, args.output_dir)
