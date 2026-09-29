@@ -69,6 +69,7 @@ WATCHLIST = {
 }
 ALL_SYMBOLS = [symbol for symbols in WATCHLIST.values() for symbol in symbols]
 REFRESH_SECONDS = 60
+APP_VERSION = os.environ.get("BOT_VERSION", "dev")
 LOG_LIMIT = 200
 ROW_WIDTHS = [1.6, 1, 1, 1.2, 1.5, 1.8]
 PARAMS = StrategyParams()
@@ -637,7 +638,9 @@ def main() -> None:
     st.set_page_config(page_title="Trading Dashboard ~ Watchlist", page_icon="📈", layout="wide")
     silent_auto_refresh(seconds=15)
     init_state()
-    st.title("📈 Trading Dashboard")
+    title_column, version_column = st.columns([5, 1], vertical_alignment="center")
+    title_column.title("📈 Trading Dashboard")
+    version_column.metric("Versione", APP_VERSION)
     st.caption("Alpaca Paper Trading ~ strategia range: ADX < max, RSI < max, prezzo ≤ Bollinger inferiore "
                "(soglie e rischio dal profilo di ogni titolo)")
 
