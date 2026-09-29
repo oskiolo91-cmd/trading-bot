@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +69,7 @@ WATCHLIST = {
 }
 ALL_SYMBOLS = [symbol for symbols in WATCHLIST.values() for symbol in symbols]
 REFRESH_SECONDS = 60
+REFRESH_WORKERS = 8
 APP_VERSION = os.environ.get("BOT_VERSION", "v2.1")
 LOG_LIMIT = 200
 ROW_WIDTHS = [1.6, 1, 1, 1.2, 1.5, 1.8]
@@ -84,6 +85,11 @@ DEFAULT_PROFILE = "⚖️ Bilanciato"
 CUSTOM_PROFILE = "🎛️ Custom"
 BACKTEST_PERIOD = "90d"
 EASTERN = ZoneInfo("America/New_York")
+
+
+@st.cache_resource
+def get_ticker_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=REFRESH_WORKERS, thread_name_prefix="ticker-refresh")
 NO_KEYS_MESSAGE = (
     "Chiavi Alpaca non configurate: aggiungi ALPACA_API_KEY e ALPACA_SECRET_KEY nei Secrets "
     "dell'app (Streamlit Cloud → Settings → Secrets). Bot e ordini sono disattivati, "
@@ -184,16 +190,32 @@ def backtest_table(results: dict[str, BacktestResult]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["Profilo", "Rendimento %", "Win rate %", "Max drawdown %", "N. trade"])
 
 
+def _fetch_ticker_result(symbol: str) -> dict:
+    try:
+        return {**fetch_ticker_data(symbol), "last_updated": datetime.now()}
+    except Exception as exc:
+        return {"error": str(exc), "signal": False, "last_updated": datetime.now()}
+
+
 def fetch_all_tickers(symbols: list, on_progress=None) -> dict:
+    executor = get_ticker_executor()
+    futures = {executor.submit(_fetch_ticker_result, symbol): symbol for symbol in symbols}
     results: dict[str, dict] = {}
-    for index, symbol in enumerate(symbols, start=1):
-        try:
-            results[symbol] = {**fetch_ticker_data(symbol), "last_updated": datetime.now()}
-        except Exception as exc:
-            results[symbol] = {"error": str(exc), "signal": False, "last_updated": datetime.now()}
+    for index, future in enumerate(as_completed(futures), start=1):
+        symbol = futures[future]
+        results[symbol] = future.result()
         if on_progress is not None:
             on_progress(index, len(symbols), symbol)
-    return results
+    return {symbol: results[symbol] for symbol in symbols}
+
+
+def start_ticker_refresh(state, symbols: list[str]) -> None:
+    executor = get_ticker_executor()
+    state["refresh_jobs"] = {
+        symbol: executor.submit(_fetch_ticker_result, symbol) for symbol in symbols
+    }
+    state["refresh_completed"] = 0
+    state["refresh_errors"] = []
 
 
 def get_positions_map(client) -> dict:
@@ -643,21 +665,8 @@ def load_account(client) -> tuple[float | None, dict, str | None]:
         return None, {}, f"Alpaca non raggiungibile (bot e ordini disattivati): {exc}"
 
 
-def auto_refresh_countdown() -> None:
-    placeholder = st.empty()
-    while True:
-        last = st.session_state.get("last_refresh") or datetime.now()
-        remaining = REFRESH_SECONDS - (datetime.now() - last).total_seconds()
-        if remaining <= 0:
-            break
-        placeholder.caption(f"⏱️ Prossimo aggiornamento automatico tra {math.ceil(remaining)}s")
-        time.sleep(1)
-    st.rerun()
-
-
 def main() -> None:
     st.set_page_config(page_title="Trading Dashboard ~ Watchlist", page_icon="📈", layout="wide")
-    silent_auto_refresh(seconds=15)
     init_state()
     title_column, version_column = st.columns([5, 1], vertical_alignment="center")
     title_column.title("📈 Trading Dashboard")
@@ -672,20 +681,43 @@ def main() -> None:
     controls = st.columns([2, 1.3, 1, 1], vertical_alignment="center")
     search_query = controls[0].text_input("Cerca ticker", placeholder="Es. SPY, NVDA")
     category_filter = controls[1].selectbox("Settore", ["Tutti", *WATCHLIST])
-    controls[2].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
-    controls[3].toggle("Auto-refresh", key="auto_refresh")
+    refresh_requested = controls[2].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
+    auto_refresh = controls[3].toggle("Auto-refresh", key="auto_refresh")
 
-    if needs_refresh():
-        progress = st.progress(0.0, text="Scarico i dati della watchlist…")
-        st.session_state["live_data"] = fetch_all_tickers(
-            ALL_SYMBOLS,
-            lambda done, total, symbol: progress.progress(done / total, text=f"Scarico {symbol} ({done}/{total})…"),
-        )
-        progress.empty()
-        if client is not None and equity is not None:
-            run_bot_cycle(client, st.session_state, positions, equity)
-        st.session_state["last_refresh"] = datetime.now()
-    st.caption(f"Ultimo aggiornamento dati: {st.session_state['last_refresh']:%H:%M:%S}")
+    refresh_jobs = st.session_state.get("refresh_jobs")
+    if refresh_jobs is not None:
+        for symbol, future in list(refresh_jobs.items()):
+            if not future.done():
+                continue
+            result = future.result()
+            st.session_state["live_data"][symbol] = result
+            if result.get("error"):
+                st.session_state["refresh_errors"].append(symbol)
+            del refresh_jobs[symbol]
+            st.session_state["refresh_completed"] += 1
+        if not refresh_jobs:
+            st.session_state.pop("refresh_jobs", None)
+            st.session_state["last_refresh"] = datetime.now()
+            if client is not None and equity is not None:
+                run_bot_cycle(client, st.session_state, positions, equity)
+
+    if "refresh_jobs" not in st.session_state and (refresh_requested or (auto_refresh and needs_refresh())):
+        start_ticker_refresh(st.session_state, ALL_SYMBOLS)
+        refresh_jobs = st.session_state["refresh_jobs"]
+
+    if auto_refresh or "refresh_jobs" in st.session_state:
+        silent_auto_refresh(seconds=15 if auto_refresh else 2)
+    if "refresh_jobs" in st.session_state:
+        completed = st.session_state["refresh_completed"]
+        st.progress(completed / len(ALL_SYMBOLS), text=f"Aggiornamento dati in background: {completed}/{len(ALL_SYMBOLS)}")
+    last_refresh = st.session_state.get("last_refresh")
+    if last_refresh:
+        st.caption(f"Ultimo aggiornamento dati: {last_refresh:%H:%M:%S}")
+    else:
+        st.caption("Primo aggiornamento dati in corso…")
+    refresh_errors = st.session_state.get("refresh_errors", [])
+    if refresh_errors:
+        st.warning(f"Dati non disponibili per {', '.join(refresh_errors)}.")
     if any(st.session_state["bot_enabled"].values()):
         st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
 
@@ -697,10 +729,6 @@ def main() -> None:
             st.code("\n".join(reversed(entries)), language=None)
         else:
             st.caption("Nessuna azione registrata.")
-
-    if st.session_state["auto_refresh"]:
-        auto_refresh_countdown()
-
 
 if __name__ == "__main__":
     main()
