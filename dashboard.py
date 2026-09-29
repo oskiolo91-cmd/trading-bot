@@ -541,8 +541,10 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
             defaults = {}
             if trading_ok and "price" in data and math.isfinite(data["atr"]) and math.isfinite(data["bb_lower"]):
                 limit, stop, shares = order_plan(data, equity, params)
+                target = limit + ((limit - stop) * 2)
                 defaults = {f"buy_limit_{symbol}": max(0.0, limit), f"buy_stop_{symbol}": max(0.0, stop),
                             f"buy_shares_{symbol}": shares, f"buy_confirm_{symbol}": False}
+                st.caption(f"🎯 Target 1:2: ${target:,.2f}")
             st.button("Compra", key=f"buy_{symbol}", disabled=not defaults, on_click=_on_open_panel,
                       args=(symbol, "buy", defaults))
         st.button("📊 Backtest", key=f"backtest_{symbol}", on_click=_on_toggle_backtest, args=(symbol,))
@@ -597,6 +599,7 @@ def auto_refresh_countdown() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Trading Dashboard ~ Watchlist", page_icon="📈", layout="wide")
+    silent_auto_refresh(seconds=15)
     init_state()
     st.title("📈 Trading Dashboard")
     st.caption("Alpaca Paper Trading ~ strategia range: ADX < max, RSI < max, prezzo ≤ Bollinger inferiore "
