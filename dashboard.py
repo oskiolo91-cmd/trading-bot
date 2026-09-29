@@ -6,7 +6,7 @@ import math
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,7 +78,12 @@ def to_alpaca_symbol(symbol: str) -> str:
 
 
 def fetch_ticker_data(symbol: str) -> dict:
-    frame = download_daily_bars(symbol, lookback_days=400, end=datetime.now(timezone.utc))
+    alpaca_symbol = to_alpaca_symbol(symbol)
+    frame = download_daily_bars(alpaca_symbol, lookback_days=400, end=datetime.now(timezone.utc))[alpaca_symbol]
+    return _ticker_data_from_frame(symbol, frame)
+
+
+def _ticker_data_from_frame(symbol: str, frame: pd.DataFrame) -> dict:
     if frame.empty:
         raise ValueError(f"Nessuna barra Alpaca per {symbol}")
     frame = frame.copy()
@@ -132,7 +137,8 @@ def get_ticker_params(symbol: str, state=None) -> StrategyParams:
 
 def run_profile_backtest(symbol: str) -> dict[str, BacktestResult]:
     """Run backtest for all 3 preset profiles on 90 days of data."""
-    frame = download_daily_bars(symbol, lookback_days=90, end=datetime.now(timezone.utc))
+    alpaca_symbol = to_alpaca_symbol(symbol)
+    frame = download_daily_bars(alpaca_symbol, lookback_days=90, end=datetime.now(timezone.utc))[alpaca_symbol]
     if frame.empty:
         raise ValueError(f"Nessuna barra Alpaca per {symbol}")
     frame = frame.copy()
@@ -254,21 +260,32 @@ def render_candlestick_chart(client, symbol: str, ticker_data: dict, params: Str
             st.warning(f"Storico entry non disponibile per {symbol}: {exc}")
 
         try:
-            stop_orders = [
+            sell_orders = [
                 order for order in _open_orders(client, alpaca_symbol)
                 if order.symbol == alpaca_symbol
                 and order.side == OrderSide.SELL
-                and getattr(order, "stop_price", None) is not None
             ]
-            for index, order in enumerate(stop_orders):
-                figure.add_hline(
-                    y=float(order.stop_price),
-                    line_dash="dash",
-                    line_color="#c83232",
-                    annotation_text="Stop / trailing" if index == 0 else None,
-                    row=1,
-                    col=1,
-                )
+            for order in sell_orders:
+                stop_price = getattr(order, "stop_price", None)
+                if stop_price is not None:
+                    figure.add_hline(
+                        y=float(stop_price),
+                        line_dash="dash",
+                        line_color="#c83232",
+                        annotation_text="Stop / trailing",
+                        row=1,
+                        col=1,
+                    )
+                target_price = getattr(order, "limit_price", None)
+                if target_price is not None:
+                    figure.add_hline(
+                        y=float(target_price),
+                        line_dash="dot",
+                        line_color="#16834a",
+                        annotation_text="Take profit",
+                        row=1,
+                        col=1,
+                    )
         except Exception as exc:
             st.warning(f"Stop attivo non disponibile per {symbol}: {exc}")
 
@@ -291,6 +308,119 @@ def render_candlestick_chart(client, symbol: str, ticker_data: dict, params: Str
     )
 
 
+def _display_symbol(alpaca_symbol: str) -> str:
+    return next((symbol for symbol in ALL_SYMBOLS if to_alpaca_symbol(symbol) == alpaca_symbol), alpaca_symbol)
+
+
+def get_active_symbols(positions: dict, state=None) -> list[str]:
+    state = st.session_state if state is None else state
+    symbols = [CHART_SYMBOLS[0]]
+    symbols.extend(
+        symbol for symbol, enabled in state.get("bot_enabled", {}).items() if enabled
+    )
+    symbols.extend(_display_symbol(symbol) for symbol in positions)
+    return list(dict.fromkeys(symbol for symbol in symbols if symbol))
+
+
+def render_symbol_card(client, equity: float | None, symbol: str, positions: dict) -> None:
+    data = st.session_state["live_data"].get(symbol, {})
+    params = get_ticker_params(symbol)
+    position = positions.get(to_alpaca_symbol(symbol))
+    trading_ok = client is not None and equity is not None
+
+    with st.container(border=True):
+        price = data.get("price")
+        change = data.get("prev_close")
+        price_delta = (price / change - 1) * 100 if price and change else None
+        header = st.columns([1.1, 2.4, 1.2], vertical_alignment="center")
+        header[0].markdown(f"### {symbol}")
+        header[0].metric(
+            "Prezzo",
+            f"${price:,.2f}" if isinstance(price, (int, float)) else "—",
+            delta=f"{price_delta:+.2f}%" if price_delta is not None else None,
+        )
+        if trading_ok:
+            with header[1]:
+                render_symbol_risk_status(client, symbol, data, params)
+            header[2].button(
+                "🛑 KILL SIMBOLO",
+                key=f"card_kill_{symbol}",
+                type="primary",
+                on_click=_on_kill_symbol,
+                args=(client, symbol),
+                disabled=client is None,
+            )
+        else:
+            header[1].caption("P&L non disponibile senza connessione Alpaca.")
+
+        if position is not None:
+            pnl = float(position.unrealized_pl or 0)
+            header[0].caption(f"Posizione {float(position.qty):.4f} · P&L non realizzato ${pnl:+.2f}")
+
+        default_limit = max(0.01, float(data.get("bb_lower", price or 0.01)))
+        default_stop = max(
+            0.01,
+            float(data.get("bb_lower", price or 0.01) - params.stop_loss_atr_mult * data.get("atr", 0.0)),
+        )
+        has_quote = all(
+            isinstance(data.get(key), (int, float)) and math.isfinite(data[key])
+            for key in ("price", "atr", "bb_lower")
+        )
+        if has_quote and not st.session_state.get(f"buy_defaults_loaded_{symbol}"):
+            st.session_state[f"buy_limit_{symbol}"] = default_limit
+            st.session_state[f"buy_stop_{symbol}"] = min(default_stop, default_limit - 0.01)
+            st.session_state[f"buy_defaults_loaded_{symbol}"] = True
+        st.session_state.setdefault(f"buy_limit_{symbol}", 0.01)
+        st.session_state.setdefault(f"buy_stop_{symbol}", 0.01)
+        st.session_state.setdefault(f"buy_budget_{symbol}", params.trade_budget_usd)
+        st.session_state.setdefault(f"buy_confirm_{symbol}", False)
+        order_controls = st.columns([1, 1, 1, 1, 1], vertical_alignment="bottom")
+        order_controls[0].number_input(
+            "Budget (USD)", min_value=1.0, step=25.0, key=f"buy_budget_{symbol}"
+        )
+        order_controls[1].number_input(
+            "Prezzo limite ($)", min_value=0.01, step=0.01, key=f"buy_limit_{symbol}"
+        )
+        order_controls[2].number_input(
+            "Stop loss ($)", min_value=0.01, step=0.01, key=f"buy_stop_{symbol}"
+        )
+        limit_price = st.session_state[f"buy_limit_{symbol}"]
+        estimated_qty = (
+            round(st.session_state[f"buy_budget_{symbol}"] / limit_price, 4)
+            if has_quote and limit_price > 0
+            else None
+        )
+        order_controls[3].caption(
+            f"Quantità: {estimated_qty:.4f} az." if estimated_qty is not None else "Quantità: in attesa dei dati"
+        )
+        confirmed = order_controls[4].checkbox("Conferma", key=f"card_confirm_{symbol}")
+        order_controls[4].button(
+            "Invia ordine",
+            key=f"card_buy_{symbol}",
+            on_click=_on_submit_buy,
+            args=(client, symbol),
+            disabled=(
+                not trading_ok
+                or not has_quote
+                or position is not None
+                or estimated_qty is None
+                or estimated_qty <= 0
+                or not confirmed
+            ),
+            type="primary",
+        )
+
+        message = st.session_state["panel_msg"].get(symbol)
+        if message:
+            (st.success if message[0] == "success" else st.error)(message[1])
+        if data.get("chart_data") is not None:
+            render_candlestick_chart(client, symbol, data, params)
+        elif data.get("error"):
+            st.warning(f"Dati di {symbol} non disponibili: {data['error']}")
+        else:
+            st.info(f"Grafico di {symbol} in attesa delle barre Alpaca.")
+
+
 def _fetch_ticker_result(symbol: str) -> dict:
     try:
         return {**fetch_ticker_data(symbol), "last_updated": datetime.now()}
@@ -299,45 +429,61 @@ def _fetch_ticker_result(symbol: str) -> dict:
 
 
 def fetch_all_tickers(symbols: list, on_progress=None) -> dict:
-    executor = get_ticker_executor()
-    futures = {executor.submit(_fetch_ticker_result, symbol): symbol for symbol in symbols}
-    results: dict[str, dict] = {}
-    for index, future in enumerate(as_completed(futures), start=1):
-        symbol = futures[future]
-        results[symbol] = future.result()
+    results = _fetch_ticker_batch(symbols)
+    for index, symbol in enumerate(symbols, start=1):
         if on_progress is not None:
             on_progress(index, len(symbols), symbol)
-    return {symbol: results[symbol] for symbol in symbols}
+    return results
+
+
+def _fetch_ticker_batch(symbols: list[str]) -> dict[str, dict]:
+    alpaca_symbols = [to_alpaca_symbol(symbol) for symbol in symbols]
+    try:
+        frames = download_daily_bars(alpaca_symbols, lookback_days=400, end=datetime.now(timezone.utc))
+    except Exception as exc:
+        return {symbol: {"error": str(exc), "signal": False, "last_updated": datetime.now()} for symbol in symbols}
+    results = {}
+    for symbol, alpaca_symbol in zip(symbols, alpaca_symbols):
+        try:
+            results[symbol] = {
+                **_ticker_data_from_frame(symbol, frames[alpaca_symbol]),
+                "last_updated": datetime.now(),
+            }
+        except Exception as exc:
+            results[symbol] = {"error": str(exc), "signal": False, "last_updated": datetime.now()}
+    return results
 
 
 def start_ticker_refresh(state, symbols: list[str]) -> None:
     executor = get_ticker_executor()
+    batches = [symbols[index:index + REFRESH_WORKERS] for index in range(0, len(symbols), REFRESH_WORKERS)]
     state["refresh_jobs"] = {
-        symbol: executor.submit(_fetch_ticker_result, symbol) for symbol in symbols
+        index: executor.submit(_fetch_ticker_batch, batch)
+        for index, batch in enumerate(batches)
     }
     state["refresh_completed"] = 0
+    state["refresh_total"] = len(symbols)
     state["refresh_errors"] = []
 
 
 @st.fragment(run_every="2s")
-def render_refresh_controller(client, equity: float | None, positions: dict) -> None:
+def render_refresh_controller(client, equity: float | None, positions: dict, refresh_symbols: list[str]) -> None:
     state = st.session_state
     if "refresh_jobs" not in state:
         refresh_requested = state.pop("refresh_requested", False)
         if refresh_requested or (state.get("auto_refresh", True) and needs_refresh()):
-            start_ticker_refresh(state, CHART_SYMBOLS)
+            start_ticker_refresh(state, refresh_symbols)
 
     refresh_jobs = state.get("refresh_jobs")
     if refresh_jobs is not None:
-        for symbol, future in list(refresh_jobs.items()):
+        for batch_id, future in list(refresh_jobs.items()):
             if not future.done():
                 continue
-            result = future.result()
-            state["live_data"][symbol] = result
-            if result.get("error"):
-                state["refresh_errors"].append(symbol)
-            del refresh_jobs[symbol]
-            state["refresh_completed"] += 1
+            results = future.result()
+            state["live_data"].update(results)
+            state["refresh_errors"].extend(symbol for symbol, result in results.items() if result.get("error"))
+            state["refresh_completed"] += len(results)
+            del refresh_jobs[batch_id]
 
         if not refresh_jobs:
             state.pop("refresh_jobs", None)
@@ -347,7 +493,8 @@ def render_refresh_controller(client, equity: float | None, positions: dict) -> 
             st.rerun(scope="app")
 
         completed = state["refresh_completed"]
-        st.progress(completed / len(CHART_SYMBOLS), text=f"Aggiornamento dati in background: {completed}/{len(CHART_SYMBOLS)}")
+        total = max(1, state.get("refresh_total", len(refresh_symbols)))
+        st.progress(completed / total, text=f"Aggiornamento dati in background: {completed}/{total}")
     else:
         last_refresh = state.get("last_refresh")
         if last_refresh:
@@ -887,23 +1034,17 @@ def main() -> None:
     category_filter = controls[1].selectbox("Settore", ["Tutti", *WATCHLIST])
     controls[2].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
     controls[3].toggle("Auto-refresh", key="auto_refresh")
-    chart_symbol = st.selectbox(
-        "Grafico ticker",
-        CHART_SYMBOLS,
-        index=0,
-    )
-    render_refresh_controller(client, equity, positions)
-    chart_params = get_ticker_params(chart_symbol)
-    render_candlestick_chart(
-        client,
-        chart_symbol,
-        st.session_state["live_data"].get(chart_symbol, {}),
-        chart_params,
-    )
+    active_symbols = get_active_symbols(positions)
+    refresh_symbols = list(dict.fromkeys([*CHART_SYMBOLS, *active_symbols]))
+    render_refresh_controller(client, equity, positions, refresh_symbols)
+    st.subheader("Moduli attivi")
+    for symbol in active_symbols:
+        render_symbol_card(client, equity, symbol, positions)
     if any(st.session_state["bot_enabled"].values()):
         st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
 
-    render_watchlist(client, equity, positions, category_filter, search_query)
+    with st.expander("Watchlist e segnali", expanded=False):
+        render_watchlist(client, equity, positions, category_filter, search_query)
 
     with st.expander("Log Bot", expanded=False):
         entries = st.session_state["bot_log"][-20:]
