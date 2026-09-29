@@ -76,3 +76,28 @@ def test_websocket_partial_fill_updates_incrementally_and_deduplicates():
 
     assert state.position_qty == Decimal("0.50")
     assert state.average_entry_price == Decimal("100.5")
+
+
+def test_historical_fill_parser_accepts_minimal_alpaca_activity_payload():
+    import live_trader
+
+    class MinimalActivityClient:
+        def get(self, path, query):
+            assert path == "/account/activities/FILL"
+            return [{
+                "id": "activity-1",
+                "symbol": "SPY",
+                "side": "buy",
+                "qty": "0.25",
+                "price": "100.00",
+                "transaction_time": "2026-09-29T15:00:00Z",
+            }]
+
+    client = MinimalActivityClient()
+    live_trader._ACTIVITY_CACHE.pop(id(client), None)
+    fills = live_trader._get_trade_activities(client)
+
+    assert len(fills) == 1
+    assert fills[0].symbol == "SPY"
+    assert fills[0].qty == 0.25
+    assert fills[0].price == 100.0

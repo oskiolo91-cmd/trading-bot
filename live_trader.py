@@ -7,8 +7,8 @@ import logging
 import math
 import os
 import sys
-from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from threading import RLock, Thread
@@ -19,7 +19,7 @@ from alpaca.data.enums import DataFeed
 from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
-from alpaca.trading.models import TradeActivity, TradeUpdate
+from alpaca.trading.models import TradeUpdate
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
@@ -30,7 +30,6 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.stream import TradingStream
 import pandas as pd
-from pydantic import TypeAdapter
 
 BOT_DIR = Path(__file__).resolve().parent
 if str(BOT_DIR) not in sys.path:
@@ -43,7 +42,19 @@ from signals import entry_limit_price, evaluate_exit, stop_loss_price
 
 EASTERN = ZoneInfo("America/New_York")
 LOG = logging.getLogger(__name__)
-_ACTIVITY_CACHE: dict[int, tuple[datetime, list[TradeActivity]]] = {}
+
+
+@dataclass(frozen=True)
+class TradeFill:
+    id: str
+    symbol: str
+    side: str
+    qty: float
+    price: float
+    transaction_time: datetime
+
+
+_ACTIVITY_CACHE: dict[int, tuple[datetime, list[TradeFill]]] = {}
 _SYMBOL_STATES: dict[str, SymbolState] = {}
 _SYMBOL_STATE_LOCK = RLock()
 _TRADE_STREAM: TradingStream | None = None
@@ -83,13 +94,37 @@ def close_symbol_position(client: TradingClient, symbol: str) -> bool:
     return True
 
 
-def _get_trade_activities(client: TradingClient) -> list[TradeActivity]:
+def _parse_trade_fill(payload: Mapping) -> TradeFill:
+    """Parse only fields required for FIFO, independent of optional Alpaca activity fields."""
+    timestamp = payload.get("transaction_time") or payload.get("date")
+    if isinstance(timestamp, str):
+        timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if not isinstance(timestamp, datetime):
+        raise ValueError("Alpaca fill activity has no valid transaction timestamp")
+
+    side = str(getattr(payload.get("side"), "value", payload.get("side", ""))).lower()
+    if side not in {OrderSide.BUY.value, OrderSide.SELL.value}:
+        raise ValueError("Alpaca fill activity has an invalid side")
+
+    quantity = float(payload.get("qty", 0))
+    price = float(payload.get("price", 0))
+    symbol = str(payload.get("symbol", ""))
+    if not symbol or not math.isfinite(quantity) or not math.isfinite(price) or quantity <= 0 or price <= 0:
+        raise ValueError("Alpaca fill activity has invalid symbol, quantity, or price")
+
+    activity_id = payload.get("id")
+    if not activity_id:
+        activity_id = f"{payload.get('order_id', symbol)}:{payload.get('cum_qty', quantity)}:{timestamp.isoformat()}"
+    return TradeFill(str(activity_id), symbol, side, quantity, price, timestamp)
+
+
+def _get_trade_activities(client: TradingClient) -> list[TradeFill]:
     now = datetime.now(timezone.utc)
     cached = _ACTIVITY_CACHE.get(id(client))
     if cached and now - cached[0] < timedelta(seconds=30):
         return cached[1]
 
-    activities: list[TradeActivity] = []
+    activities: list[TradeFill] = []
     page_token = None
     has_more_pages = True
     while has_more_pages:
@@ -97,14 +132,18 @@ def _get_trade_activities(client: TradingClient) -> list[TradeActivity]:
         if page_token:
             query["page_token"] = page_token
         response = client.get("/account/activities/FILL", query)
-        page = TypeAdapter(list[TradeActivity]).validate_python(response)
-        if not page:
+        if not isinstance(response, list):
+            raise ValueError("Alpaca FILL activities response is not a list")
+        if not response:
             break
+        page = [_parse_trade_fill(payload) for payload in response if isinstance(payload, Mapping)]
+        if len(page) != len(response):
+            raise ValueError("Alpaca FILL activities response contains a non-object record")
         activities.extend(page)
-        if len(page) < 100:
+        if len(response) < 100:
             has_more_pages = False
         else:
-            page_token = str(page[-1].id)
+            page_token = str(response[-1].get("id") or page[-1].id)
 
     _ACTIVITY_CACHE[id(client)] = (now, activities)
     return activities
