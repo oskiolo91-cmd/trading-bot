@@ -69,7 +69,7 @@ WATCHLIST = {
 }
 ALL_SYMBOLS = [symbol for symbols in WATCHLIST.values() for symbol in symbols]
 REFRESH_SECONDS = 60
-APP_VERSION = os.environ.get("BOT_VERSION", "dev")
+APP_VERSION = os.environ.get("BOT_VERSION", "v2.1")
 LOG_LIMIT = 200
 ROW_WIDTHS = [1.6, 1, 1, 1.2, 1.5, 1.8]
 PARAMS = StrategyParams()
