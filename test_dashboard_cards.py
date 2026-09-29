@@ -28,7 +28,7 @@ def test_ticker_batch_requests_ohlcv_once_for_multiple_symbols(monkeypatch):
         calls.append(symbols)
         return {symbol: frame.copy() for symbol in symbols}
 
-    monkeypatch.setattr(dashboard, "download_daily_bars", fake_download)
+    monkeypatch.setattr(dashboard, "fetch_daily_bars", fake_download)
     results = dashboard._fetch_ticker_batch(["SPY", "QQQ", "BRK-B"])
 
     assert calls == [["SPY", "QQQ", "BRK.B"]]

@@ -8,7 +8,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -26,6 +26,7 @@ if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 from backtest import BacktestResult, download_daily_bars, prepare_data, run_backtest
+from alpaca_data import fetch_daily_bars
 from models import StrategyParams
 from live_trader import (
     _check_exit_once, _initial_position, _open_orders, close_symbol_position,
@@ -439,7 +440,8 @@ def fetch_all_tickers(symbols: list, on_progress=None) -> dict:
 def _fetch_ticker_batch(symbols: list[str]) -> dict[str, dict]:
     alpaca_symbols = [to_alpaca_symbol(symbol) for symbol in symbols]
     try:
-        frames = download_daily_bars(alpaca_symbols, lookback_days=400, end=datetime.now(timezone.utc))
+        end = datetime.now(timezone.utc)
+        frames = fetch_daily_bars(alpaca_symbols, start=end - timedelta(days=400), end=end)
     except Exception as exc:
         return {symbol: {"error": str(exc), "signal": False, "last_updated": datetime.now()} for symbol in symbols}
     results = {}
