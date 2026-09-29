@@ -338,8 +338,10 @@ def prepare_ticker_selection(
     current_selection: list[str] | None,
     positions: dict,
     bot_enabled: dict[str, bool],
+    active_tickers: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     available = set(available_symbols)
+    available_by_alpaca = {to_alpaca_symbol(symbol): symbol for symbol in available_symbols}
     if current_selection is None:
         selected = [symbol for symbol in DEFAULT_SYMBOLS if symbol in available]
         if not selected:
@@ -351,7 +353,8 @@ def prepare_ticker_selection(
         symbol for symbol, enabled in bot_enabled.items()
         if enabled and symbol in available
     ]
-    required.extend(symbol for symbol in positions if symbol in available)
+    required.extend(symbol for symbol in (active_tickers or []) if symbol in available)
+    required.extend(available_by_alpaca[symbol] for symbol in positions if symbol in available_by_alpaca)
     required = list(dict.fromkeys(required))
     missing = [symbol for symbol in required if symbol not in selected]
     return list(dict.fromkeys([*selected, *required])), missing
@@ -701,6 +704,7 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
 def init_state() -> None:
     defaults = {
         "bot_enabled": {},
+        "active_tickers": [],
         "live_data": {}, "bot_log": [], "bot_state": {}, "bot_last_buy": {},
         "panels": {}, "panel_msg": {}, "bot_notice": {}, "auto_refresh": True,
         "profile": {},
@@ -725,6 +729,12 @@ def _on_toggle(symbol: str) -> None:
     enabled = bool(st.session_state.get(f"bot_{symbol}"))
     st.session_state["bot_enabled"][symbol] = enabled
     st.session_state["bot_notice"][symbol] = enabled
+    active_tickers = set(st.session_state.get("active_tickers", []))
+    if enabled:
+        active_tickers.add(symbol)
+    else:
+        active_tickers.discard(symbol)
+    st.session_state["active_tickers"] = sorted(active_tickers)
     add_log(st.session_state, f"🤖 {symbol}: bot {'ATTIVATO' if enabled else 'disattivato'}")
 
 
@@ -794,6 +804,9 @@ def _on_kill_symbol(client, symbol: str) -> None:
         close_symbol_position(client, alpaca_symbol)
         st.session_state["bot_enabled"][symbol] = False
         st.session_state["bot_state"].pop(symbol, None)
+        st.session_state["active_tickers"] = [
+            ticker for ticker in st.session_state.get("active_tickers", []) if ticker != symbol
+        ]
         add_log(st.session_state, f"🛑 {symbol}: KILL SIMBOLO, ordini annullati e posizione chiusa")
     except Exception as exc:
         add_log(st.session_state, f"🛑 {symbol}: KILL SIMBOLO fallito: {exc}")
@@ -1055,6 +1068,142 @@ def render_watchlist(
             render_ticker_row(symbol, client, equity, positions)
 
 
+def render_market_explorer(positions: dict) -> None:
+    radar_path = BOT_DIR / "market_radar.csv"
+    if not radar_path.exists():
+        st.info("Market radar non ancora generato. Esegui `python screener.py` per crearlo.")
+        return
+    try:
+        radar = pd.read_csv(radar_path)
+    except Exception as exc:
+        st.error(f"Impossibile leggere market_radar.csv: {exc}")
+        return
+
+    required = {
+        "Symbol", "Sector", "QuoteType", "MarketCap", "Close", "Volume_SMA20",
+        "ADX", "ATR_pct", "RSI", "BB_lower", "SMA_200",
+        "Validatore_Scalper", "Validatore_Trend",
+    }
+    missing = sorted(required - set(radar.columns))
+    if missing:
+        st.error(f"market_radar.csv non contiene: {', '.join(missing)}")
+        return
+
+    filters = st.columns([2, 1.4, 1.2, 1.2])
+    sectors = sorted(radar["Sector"].dropna().astype(str).unique())
+    quote_types = sorted(radar["QuoteType"].dropna().astype(str).unique())
+    selected_sectors = filters[0].multiselect("Settore", sectors, default=sectors)
+    selected_types = filters[1].multiselect("Tipo", quote_types, default=quote_types)
+    scalper_only = filters[2].toggle("🔥 Mostra solo segnali Scalper", key="radar_scalper_only")
+    trend_only = filters[3].toggle("🚀 Mostra solo segnali Trend", key="radar_trend_only")
+
+    filtered = filter_market_radar(
+        radar, selected_sectors, selected_types, scalper_only, trend_only
+    )
+    if filtered.empty:
+        st.info("Nessun ticker corrisponde ai filtri selezionati.")
+        return
+
+    active_tickers = set(st.session_state.get("active_tickers", []))
+    filtered["Attiva Bot"] = filtered["Symbol"].astype(str).isin(active_tickers)
+    filtered["Validatore_Scalper"] = filtered["Validatore_Scalper"].map({True: "🟢", False: "🔴"})
+    filtered["Validatore_Trend"] = filtered["Validatore_Trend"].map({True: "🟢", False: "🔴"})
+    visible_symbols = set(filtered["Symbol"].astype(str))
+    edited = st.data_editor(
+        filtered,
+        hide_index=True,
+        use_container_width=True,
+        disabled=[column for column in filtered.columns if column != "Attiva Bot"],
+        column_config={
+            "Attiva Bot": st.column_config.CheckboxColumn(
+                "Attiva Bot",
+                help="Aggiunge il ticker ai moduli del tab Controllo Bot.",
+                default=False,
+            ),
+            "MarketCap": st.column_config.NumberColumn("Market Cap", format="$%d"),
+            "Close": st.column_config.NumberColumn("Close", format="$%.2f"),
+            "Volume_SMA20": st.column_config.NumberColumn("Volume SMA20", format="%d"),
+            "ATR_pct": st.column_config.NumberColumn("ATR %", format="%.2f%%"),
+            "RSI": st.column_config.NumberColumn("RSI", format="%.2f"),
+            "ADX": st.column_config.NumberColumn("ADX", format="%.2f"),
+            "BB_lower": st.column_config.NumberColumn("BB Lower", format="$%.2f"),
+            "SMA_200": st.column_config.NumberColumn("SMA 200", format="$%.2f"),
+        },
+        key="market_radar_editor",
+    )
+
+    updated_active = sync_market_editor_selection(
+        active_tickers,
+        visible_symbols,
+        edited,
+        positions,
+        st.session_state["bot_enabled"],
+    )
+    if updated_active != active_tickers:
+        st.session_state["active_tickers"] = sorted(updated_active)
+        st.rerun(scope="app")
+
+
+def _radar_bool(value) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def filter_market_radar(
+    radar: pd.DataFrame,
+    sectors: list[str],
+    quote_types: list[str],
+    scalper_only: bool = False,
+    trend_only: bool = False,
+) -> pd.DataFrame:
+    filtered = radar[
+        radar["Sector"].astype(str).isin(sectors)
+        & radar["QuoteType"].astype(str).isin(quote_types)
+    ].copy()
+    filtered["Validatore_Scalper"] = filtered["Validatore_Scalper"].map(_radar_bool)
+    filtered["Validatore_Trend"] = filtered["Validatore_Trend"].map(_radar_bool)
+    if scalper_only:
+        filtered = filtered[filtered["Validatore_Scalper"]]
+    if trend_only:
+        filtered = filtered[filtered["Validatore_Trend"]]
+    return filtered
+
+
+def merge_market_editor_selection(
+    active_tickers: set[str],
+    visible_symbols: set[str],
+    edited: pd.DataFrame,
+) -> set[str]:
+    updated = active_tickers - visible_symbols
+    updated.update(
+        str(row["Symbol"])
+        for _, row in edited.iterrows()
+        if _radar_bool(row["Attiva Bot"])
+    )
+    return updated
+
+
+def sync_market_editor_selection(
+    active_tickers: set[str],
+    visible_symbols: set[str],
+    edited: pd.DataFrame,
+    positions: dict,
+    bot_enabled: dict[str, bool],
+) -> set[str]:
+    updated = merge_market_editor_selection(active_tickers, visible_symbols, edited)
+    open_symbols = {_display_symbol(symbol) for symbol in positions}
+    for _, row in edited.iterrows():
+        symbol = str(row["Symbol"])
+        checked = _radar_bool(row["Attiva Bot"])
+        if checked:
+            bot_enabled[symbol] = True
+        elif symbol in open_symbols:
+            bot_enabled[symbol] = True
+            updated.add(symbol)
+        else:
+            bot_enabled[symbol] = False
+    return updated
+
+
 def load_account(client) -> tuple[float | None, dict, str | None]:
     if client is None:
         return None, {}, None
@@ -1067,12 +1216,6 @@ def load_account(client) -> tuple[float | None, dict, str | None]:
 def main() -> None:
     st.set_page_config(page_title="Trading Dashboard ~ Watchlist", page_icon="📈", layout="wide")
     init_state()
-    title_column, version_column = st.columns([5, 1], vertical_alignment="center")
-    title_column.title("📈 Trading Dashboard")
-    version_column.metric("Versione", APP_VERSION)
-    st.caption("Alpaca Paper Trading ~ strategia range: ADX < max, RSI < max, prezzo ≤ Bollinger inferiore "
-               "(soglie e rischio dal profilo di ogni titolo)")
-
     client, connect_error = connect_alpaca()
     equity, positions, account_error = load_account(client)
     available_symbols: list[str] = []
@@ -1089,52 +1232,64 @@ def main() -> None:
                 for symbol, enabled in st.session_state["bot_enabled"].items()
                 if enabled
             )
+            tracked_symbols.update(to_alpaca_symbol(symbol) for symbol in st.session_state["active_tickers"])
             start_trade_update_stream(key, secret, client, sorted(tracked_symbols))
     else:
         st.warning(connect_error or NO_KEYS_MESSAGE)
 
-    selected_defaults, missing_required = prepare_ticker_selection(
-        available_symbols,
-        st.session_state.get("selected_tickers"),
-        positions,
-        st.session_state["bot_enabled"],
-    )
-    st.session_state["selected_tickers"] = selected_defaults
-    if missing_required:
-        st.info(
-            "Ticker con bot attivo o posizione aperta mantenuti nella selezione: "
-            + ", ".join(missing_required)
+    control_tab, explorer_tab = st.tabs(["Controllo Bot", "Esplora Mercato"])
+    with control_tab:
+        title_column, version_column = st.columns([5, 1], vertical_alignment="center")
+        title_column.title("📈 Trading Dashboard")
+        version_column.metric("Versione", APP_VERSION)
+        st.caption("Alpaca Paper Trading ~ strategia range: ADX < max, RSI < max, prezzo ≤ Bollinger inferiore "
+                   "(soglie e rischio dal profilo di ogni titolo)")
+        render_header(client, account_error or connect_error, equity, positions)
+
+        selected_defaults, missing_required = prepare_ticker_selection(
+            available_symbols,
+            st.session_state.get("selected_tickers"),
+            positions,
+            st.session_state["bot_enabled"],
+            st.session_state["active_tickers"],
         )
-    for symbol in selected_defaults:
-        st.session_state["bot_enabled"].setdefault(symbol, False)
-        st.session_state["profile"].setdefault(symbol, DEFAULT_PROFILE)
+        st.session_state["selected_tickers"] = selected_defaults
+        if missing_required:
+            st.info(
+                "Ticker con bot attivo o posizione aperta mantenuti nella selezione: "
+                + ", ".join(missing_required)
+            )
+        for symbol in selected_defaults:
+            st.session_state["bot_enabled"].setdefault(symbol, False)
+            st.session_state["profile"].setdefault(symbol, DEFAULT_PROFILE)
 
-    render_header(client, account_error or connect_error, equity, positions)
+        controls = st.columns([3, 1, 1], vertical_alignment="center")
+        selected_symbols = controls[0].multiselect(
+            "Cerca e aggiungi Ticker",
+            options=available_symbols,
+            key="selected_tickers",
+            placeholder="Cerca per simbolo…",
+        )
+        controls[1].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
+        controls[2].toggle("Auto-refresh", key="auto_refresh")
+        active_symbols = get_active_symbols(selected_symbols)
+        render_refresh_controller(client, equity, positions, active_symbols)
+        st.subheader("Moduli attivi")
+        for symbol in active_symbols:
+            render_symbol_card(client, equity, symbol, positions)
+        if any(st.session_state["bot_enabled"].values()):
+            st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
 
-    controls = st.columns([3, 1, 1], vertical_alignment="center")
-    selected_symbols = controls[0].multiselect(
-        "Cerca e aggiungi Ticker",
-        options=available_symbols,
-        key="selected_tickers",
-        placeholder="Cerca per simbolo…",
-    )
-    controls[1].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
-    controls[2].toggle("Auto-refresh", key="auto_refresh")
-    active_symbols = get_active_symbols(selected_symbols)
-    refresh_symbols = active_symbols
-    render_refresh_controller(client, equity, positions, refresh_symbols)
-    st.subheader("Moduli attivi")
-    for symbol in active_symbols:
-        render_symbol_card(client, equity, symbol, positions)
-    if any(st.session_state["bot_enabled"].values()):
-        st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
+        with st.expander("Log Bot", expanded=False):
+            entries = st.session_state["bot_log"][-20:]
+            if entries:
+                st.code("\n".join(reversed(entries)), language=None)
+            else:
+                st.caption("Nessuna azione registrata.")
 
-    with st.expander("Log Bot", expanded=False):
-        entries = st.session_state["bot_log"][-20:]
-        if entries:
-            st.code("\n".join(reversed(entries)), language=None)
-        else:
-            st.caption("Nessuna azione registrata.")
+    with explorer_tab:
+        st.subheader("Market Explorer")
+        render_market_explorer(positions)
 
 if __name__ == "__main__":
     main()
