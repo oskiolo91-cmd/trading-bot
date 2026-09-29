@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 import os
 import sys
 import time
@@ -17,7 +18,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, QueryOrderStatus
+from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest
 
 
@@ -35,15 +36,7 @@ from live_trader import (
     run_signal_check, start_trade_update_stream,
 )
 
-WATCHLIST = {
-    "Big Tech": ["AAPL", "MSFT", "GOOGL", "NVDA", "META", "AMZN", "TSLA", "AMD", "INTC", "ORCL"],
-    "Difesa": ["LMT", "RTX", "NOC", "GD", "BA", "HII", "LHX", "AXON", "KTOS"],
-    "Energia / Materie prime": ["XOM", "CVX", "COP", "SLB", "OXY", "FCX", "NEM", "AA", "CLF"],
-    "ETF": ["SPY", "QQQ", "DIA", "GLD", "SLV", "USO", "XLE", "XLK", "XLI"],
-    "Finance": ["JPM", "GS", "BRK-B", "V", "MA"],
-}
-ALL_SYMBOLS = [symbol for symbols in WATCHLIST.values() for symbol in symbols]
-CHART_SYMBOLS = list(dict.fromkeys([os.environ.get("TRADING_SYMBOL", "SPY"), *ALL_SYMBOLS]))
+DEFAULT_SYMBOLS = ("SPY", "QQQ")
 REFRESH_SECONDS = 60
 REFRESH_WORKERS = 8
 APP_VERSION = os.environ.get("BOT_VERSION", "v2.1")
@@ -66,6 +59,29 @@ EASTERN = ZoneInfo("America/New_York")
 @st.cache_resource
 def get_ticker_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=REFRESH_WORKERS, thread_name_prefix="ticker-refresh")
+
+
+def filter_fractional_assets(assets) -> list[str]:
+    return sorted({
+        asset.symbol
+        for asset in assets
+        if getattr(asset.status, "value", asset.status) == AssetStatus.ACTIVE.value
+        and asset.tradable
+        and getattr(asset, "fractionable", getattr(asset, "fractional_enabled", False))
+        and getattr(asset.asset_class, "value", asset.asset_class) == AssetClass.US_EQUITY.value
+    })
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_fractional_asset_symbols(_trading_client, credential_scope: str) -> list[str]:
+    return filter_fractional_assets(_trading_client.get_all_assets())
+
+
+def get_fractional_asset_symbols(trading_client, api_key: str, secret_key: str) -> list[str]:
+    scope = hashlib.sha256(f"{api_key}:{secret_key}".encode()).hexdigest()
+    return _cached_fractional_asset_symbols(trading_client, scope)
+
+
 NO_KEYS_MESSAGE = (
     "Chiavi Alpaca non configurate: aggiungi ALPACA_API_KEY e ALPACA_SECRET_KEY nei Secrets "
     "dell'app (Streamlit Cloud → Settings → Secrets). Bot e ordini sono disattivati, "
@@ -310,21 +326,43 @@ def render_candlestick_chart(client, symbol: str, ticker_data: dict, params: Str
 
 
 def _display_symbol(alpaca_symbol: str) -> str:
-    return next((symbol for symbol in ALL_SYMBOLS if to_alpaca_symbol(symbol) == alpaca_symbol), alpaca_symbol)
+    return alpaca_symbol
 
 
-def get_active_symbols(positions: dict, state=None) -> list[str]:
-    state = st.session_state if state is None else state
-    symbols = [CHART_SYMBOLS[0]]
-    symbols.extend(
-        symbol for symbol, enabled in state.get("bot_enabled", {}).items() if enabled
-    )
-    symbols.extend(_display_symbol(symbol) for symbol in positions)
-    return list(dict.fromkeys(symbol for symbol in symbols if symbol))
+def get_active_symbols(selected_symbols: list[str]) -> list[str]:
+    return list(dict.fromkeys(symbol for symbol in selected_symbols if symbol))
+
+
+def prepare_ticker_selection(
+    available_symbols: list[str],
+    current_selection: list[str] | None,
+    positions: dict,
+    bot_enabled: dict[str, bool],
+) -> tuple[list[str], list[str]]:
+    available = set(available_symbols)
+    if current_selection is None:
+        selected = [symbol for symbol in DEFAULT_SYMBOLS if symbol in available]
+        if not selected:
+            selected = available_symbols[:2]
+    else:
+        selected = [symbol for symbol in current_selection if symbol in available]
+
+    required = [
+        symbol for symbol, enabled in bot_enabled.items()
+        if enabled and symbol in available
+    ]
+    required.extend(symbol for symbol in positions if symbol in available)
+    required = list(dict.fromkeys(required))
+    missing = [symbol for symbol in required if symbol not in selected]
+    return list(dict.fromkeys([*selected, *required])), missing
 
 
 def render_symbol_card(client, equity: float | None, symbol: str, positions: dict) -> None:
     data = st.session_state["live_data"].get(symbol, {})
+    st.session_state["profile"].setdefault(symbol, DEFAULT_PROFILE)
+    st.session_state["bot_enabled"].setdefault(symbol, False)
+    st.session_state.setdefault(f"profile_{symbol}", st.session_state["profile"][symbol])
+    st.session_state.setdefault(f"bot_{symbol}", st.session_state["bot_enabled"][symbol])
     params = get_ticker_params(symbol)
     position = positions.get(to_alpaca_symbol(symbol))
     trading_ok = client is not None and equity is not None
@@ -357,6 +395,22 @@ def render_symbol_card(client, equity: float | None, symbol: str, positions: dic
         if position is not None:
             pnl = float(position.unrealized_pl or 0)
             header[0].caption(f"Posizione {float(position.qty):.4f} · P&L non realizzato ${pnl:+.2f}")
+
+        profile_controls = st.columns([1.5, 1], vertical_alignment="center")
+        profile_controls[0].selectbox(
+            "Profilo",
+            PROFILE_NAMES,
+            key=f"profile_{symbol}",
+            on_change=_on_profile_change,
+            args=(symbol,),
+        )
+        profile_controls[1].toggle(
+            "Bot",
+            key=f"bot_{symbol}",
+            disabled=not trading_ok,
+            on_change=_on_toggle,
+            args=(symbol,),
+        )
 
         default_limit = max(0.01, float(data.get("bb_lower", price or 0.01)))
         default_stop = max(
@@ -471,10 +525,16 @@ def start_ticker_refresh(state, symbols: list[str]) -> None:
 @st.fragment(run_every="2s")
 def render_refresh_controller(client, equity: float | None, positions: dict, refresh_symbols: list[str]) -> None:
     state = st.session_state
+    if not refresh_symbols:
+        st.caption("Seleziona almeno un ticker per caricare dati e grafici.")
+        return
     if "refresh_jobs" not in state:
         refresh_requested = state.pop("refresh_requested", False)
+        missing_symbols = [symbol for symbol in refresh_symbols if symbol not in state["live_data"]]
         if refresh_requested or (state.get("auto_refresh", True) and needs_refresh()):
             start_ticker_refresh(state, refresh_symbols)
+        elif missing_symbols:
+            start_ticker_refresh(state, missing_symbols)
 
     refresh_jobs = state.get("refresh_jobs")
     if refresh_jobs is not None:
@@ -640,10 +700,10 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
 
 def init_state() -> None:
     defaults = {
-        "bot_enabled": {symbol: False for symbol in ALL_SYMBOLS},
+        "bot_enabled": {},
         "live_data": {}, "bot_log": [], "bot_state": {}, "bot_last_buy": {},
         "panels": {}, "panel_msg": {}, "bot_notice": {}, "auto_refresh": True,
-        "profile": {symbol: DEFAULT_PROFILE for symbol in ALL_SYMBOLS},
+        "profile": {},
         "backtest_open": {},
         "backtest_cache": {},
     }
@@ -975,28 +1035,24 @@ def render_watchlist(
     client,
     equity: float | None,
     positions: dict,
-    category_filter: str = "Tutti",
+    symbols: list[str],
     search_query: str = "",
 ) -> None:
     query = search_query.strip().casefold()
-    found = False
-    for category, symbols in WATCHLIST.items():
-        if category_filter != "Tutti" and category != category_filter:
-            continue
-        visible_symbols = [symbol for symbol in symbols if query in symbol.casefold()]
-        if not visible_symbols:
-            continue
-        found = True
-        signals = sum(compute_signal(st.session_state["live_data"].get(symbol, {}), get_ticker_params(symbol))
-                      for symbol in visible_symbols)
-        with st.expander(f"{category} ~ {len(visible_symbols)} titoli ~ {signals} segnali", expanded=True):
-            head = st.columns(ROW_WIDTHS)
-            for column, label in zip(head, ("Titolo / Prezzo", "ADX", "RSI", "Segnale", "Profilo / Bot", "Azioni")):
-                column.caption(label)
-            for symbol in visible_symbols:
-                render_ticker_row(symbol, client, equity, positions)
-    if not found:
-        st.info("Nessun ticker corrisponde ai filtri selezionati.")
+    visible_symbols = [symbol for symbol in symbols if query in symbol.casefold()]
+    if not visible_symbols:
+        st.info("Nessun ticker corrisponde alla ricerca.")
+        return
+    signals = sum(
+        compute_signal(st.session_state["live_data"].get(symbol, {}), get_ticker_params(symbol))
+        for symbol in visible_symbols
+    )
+    with st.expander(f"Ticker selezionati · {len(visible_symbols)} · {signals} segnali", expanded=True):
+        head = st.columns(ROW_WIDTHS)
+        for column, label in zip(head, ("Titolo / Prezzo", "ADX", "RSI", "Segnale", "Profilo / Bot", "Azioni")):
+            column.caption(label)
+        for symbol in visible_symbols:
+            render_ticker_row(symbol, client, equity, positions)
 
 
 def load_account(client) -> tuple[float | None, dict, str | None]:
@@ -1019,9 +1075,14 @@ def main() -> None:
 
     client, connect_error = connect_alpaca()
     equity, positions, account_error = load_account(client)
+    available_symbols: list[str] = []
     if client is not None:
         key, secret, _ = _live_credentials()
         if key and secret:
+            try:
+                available_symbols = get_fractional_asset_symbols(client, key, secret)
+            except Exception as exc:
+                st.error(f"Impossibile caricare gli asset Alpaca: {exc}")
             tracked_symbols = set(positions)
             tracked_symbols.update(
                 to_alpaca_symbol(symbol)
@@ -1029,24 +1090,44 @@ def main() -> None:
                 if enabled
             )
             start_trade_update_stream(key, secret, client, sorted(tracked_symbols))
+    else:
+        st.warning(connect_error or NO_KEYS_MESSAGE)
+
+    selected_defaults, missing_required = prepare_ticker_selection(
+        available_symbols,
+        st.session_state.get("selected_tickers"),
+        positions,
+        st.session_state["bot_enabled"],
+    )
+    st.session_state["selected_tickers"] = selected_defaults
+    if missing_required:
+        st.info(
+            "Ticker con bot attivo o posizione aperta mantenuti nella selezione: "
+            + ", ".join(missing_required)
+        )
+    for symbol in selected_defaults:
+        st.session_state["bot_enabled"].setdefault(symbol, False)
+        st.session_state["profile"].setdefault(symbol, DEFAULT_PROFILE)
+
     render_header(client, account_error or connect_error, equity, positions)
 
-    controls = st.columns([2, 1.3, 1, 1], vertical_alignment="center")
-    search_query = controls[0].text_input("Cerca ticker", placeholder="Es. SPY, NVDA")
-    category_filter = controls[1].selectbox("Settore", ["Tutti", *WATCHLIST])
-    controls[2].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
-    controls[3].toggle("Auto-refresh", key="auto_refresh")
-    active_symbols = get_active_symbols(positions)
-    refresh_symbols = list(dict.fromkeys([*CHART_SYMBOLS, *active_symbols]))
+    controls = st.columns([3, 1, 1], vertical_alignment="center")
+    selected_symbols = controls[0].multiselect(
+        "Cerca e aggiungi Ticker",
+        options=available_symbols,
+        key="selected_tickers",
+        placeholder="Cerca per simbolo…",
+    )
+    controls[1].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
+    controls[2].toggle("Auto-refresh", key="auto_refresh")
+    active_symbols = get_active_symbols(selected_symbols)
+    refresh_symbols = active_symbols
     render_refresh_controller(client, equity, positions, refresh_symbols)
     st.subheader("Moduli attivi")
     for symbol in active_symbols:
         render_symbol_card(client, equity, symbol, positions)
     if any(st.session_state["bot_enabled"].values()):
         st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
-
-    with st.expander("Watchlist e segnali", expanded=False):
-        render_watchlist(client, equity, positions, category_filter, search_query)
 
     with st.expander("Log Bot", expanded=False):
         entries = st.session_state["bot_log"][-20:]

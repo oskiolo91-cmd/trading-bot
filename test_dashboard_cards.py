@@ -1,5 +1,8 @@
 import numpy as np
 import pandas as pd
+from uuid import uuid4
+from types import SimpleNamespace
+from alpaca.trading.enums import AssetClass, AssetStatus
 
 import dashboard
 
@@ -37,8 +40,53 @@ def test_ticker_batch_requests_ohlcv_once_for_multiple_symbols(monkeypatch):
     assert pd.notna(results["SPY"]["chart_data"]["SMA_200"].iloc[-1])
 
 
-def test_active_modules_combine_configured_symbol_bots_and_positions():
-    state = {"bot_enabled": {"QQQ": True, "GLD": False}}
-    symbols = dashboard.get_active_symbols({"AAPL": object()}, state)
+def test_asset_filter_keeps_only_active_tradable_fractional_equities():
+    assets = [
+        SimpleNamespace(symbol="SPY", status=AssetStatus.ACTIVE, tradable=True,
+                        fractionable=True, asset_class=AssetClass.US_EQUITY),
+        SimpleNamespace(symbol="OLD", status=AssetStatus.INACTIVE, tradable=True,
+                        fractionable=True, asset_class=AssetClass.US_EQUITY),
+        SimpleNamespace(symbol="LOCKED", status=AssetStatus.ACTIVE, tradable=False,
+                        fractionable=True, asset_class=AssetClass.US_EQUITY),
+        SimpleNamespace(symbol="WHOLE", status=AssetStatus.ACTIVE, tradable=True,
+                        fractionable=False, asset_class=AssetClass.US_EQUITY),
+        SimpleNamespace(symbol="BTC/USD", status=AssetStatus.ACTIVE, tradable=True,
+                        fractionable=True, asset_class="crypto"),
+    ]
 
-    assert symbols == ["SPY", "QQQ", "AAPL"]
+    assert dashboard.filter_fractional_assets(assets) == ["SPY"]
+
+
+def test_fractional_asset_fetch_is_cached_once_per_account():
+    class FakeClient:
+        calls = 0
+
+        def get_all_assets(self):
+            self.calls += 1
+            return [SimpleNamespace(
+                symbol="QQQ", status=AssetStatus.ACTIVE, tradable=True,
+                fractionable=True, asset_class=AssetClass.US_EQUITY,
+            )]
+
+    client = FakeClient()
+    scope = str(uuid4())
+
+    first = dashboard._cached_fractional_asset_symbols(client, scope)
+    second = dashboard._cached_fractional_asset_symbols(client, scope)
+
+    assert first == second == ["QQQ"]
+    assert client.calls == 1
+
+
+def test_selection_defaults_and_keeps_active_bot_and_positions_selected():
+    available = ["SPY", "QQQ", "AAPL", "MSFT"]
+    selected, missing = dashboard.prepare_ticker_selection(
+        available,
+        None,
+        {"MSFT": object()},
+        {"AAPL": True, "QQQ": False},
+    )
+    symbols = dashboard.get_active_symbols(selected)
+
+    assert symbols == ["SPY", "QQQ", "AAPL", "MSFT"]
+    assert missing == ["AAPL", "MSFT"]
