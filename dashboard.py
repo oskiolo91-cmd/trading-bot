@@ -385,20 +385,20 @@ def _on_open_panel(symbol: str, kind: str, defaults: dict) -> None:
 def _on_submit_buy(client, symbol: str) -> None:
     limit = float(st.session_state[f"buy_limit_{symbol}"])
     stop = float(st.session_state[f"buy_stop_{symbol}"])
-    shares = int(st.session_state[f"buy_shares_{symbol}"])
+    shares = float(st.session_state[f"buy_shares_{symbol}"])
     try:
         order_id = place_limit_buy(client, to_alpaca_symbol(symbol), limit, shares, stop)
     except Exception as exc:
         st.session_state["panel_msg"][symbol] = ("error", f"Ordine non inviato: {exc}")
         return
     st.session_state["panels"].pop(symbol, None)
-    text = f"Ordine limite inviato: {shares} az. @ ${limit:,.2f} ~ stop ${stop:,.2f} (ID {order_id})"
+    text = f"Ordine limite inviato: {shares:.4f} az. @ ${limit:,.2f} ~ stop ${stop:,.2f} (ID {order_id})"
     st.session_state["panel_msg"][symbol] = ("success", text)
     add_log(st.session_state, f"👤 {symbol}: {text}")
 
 
 def _on_submit_sell(client, symbol: str) -> None:
-    shares = int(st.session_state[f"sell_shares_{symbol}"])
+    shares = float(st.session_state[f"sell_shares_{symbol}"])
     alpaca_symbol = to_alpaca_symbol(symbol)
     try:
         cancel_open_sells(client, alpaca_symbol)
@@ -408,7 +408,7 @@ def _on_submit_sell(client, symbol: str) -> None:
         return
     st.session_state["panels"].pop(symbol, None)
     st.session_state["bot_state"].pop(symbol, None)
-    text = f"Vendita a mercato inviata: {shares} az. (ID {order_id})"
+    text = f"Vendita a mercato inviata: {shares:.4f} az. (ID {order_id})"
     st.session_state["panel_msg"][symbol] = ("success", text)
     add_log(st.session_state, f"👤 {symbol}: {text}")
 
@@ -460,16 +460,21 @@ def render_buy_panel(client, symbol: str) -> None:
         cols = st.columns(3)
         cols[0].number_input("Prezzo limite ($)", min_value=0.0, step=0.01, key=f"buy_limit_{symbol}")
         cols[1].number_input("Stop loss ($)", min_value=0.0, step=0.01, key=f"buy_stop_{symbol}")
-        cols[2].number_input("Azioni", min_value=0, step=1, key=f"buy_shares_{symbol}")
+        cols[2].number_input(
+            "Azioni", min_value=0.0001, step=0.0001, format="%.4f", key=f"buy_shares_{symbol}"
+        )
         confirmed = st.checkbox("Confermo l'ordine", key=f"buy_confirm_{symbol}")
         st.button("Invia ordine", key=f"buy_submit_{symbol}", type="primary", disabled=not confirmed,
                   on_click=_on_submit_buy, args=(client, symbol))
 
 
-def render_sell_panel(client, symbol: str, qty: int) -> None:
+def render_sell_panel(client, symbol: str, qty: float) -> None:
     with st.container(border=True):
         st.markdown(f"**Vendi {symbol}** ~ ordine a mercato")
-        st.number_input("Azioni da vendere", min_value=1, max_value=max(1, qty), step=1, key=f"sell_shares_{symbol}")
+        st.number_input(
+            "Azioni da vendere", min_value=0.0001, max_value=max(0.0001, qty),
+            step=0.0001, format="%.4f", key=f"sell_shares_{symbol}"
+        )
         st.caption("Gli stop-loss aperti su questo titolo verranno annullati prima della vendita.")
         st.button("Conferma vendita", key=f"sell_submit_{symbol}", type="primary",
                   on_click=_on_submit_sell, args=(client, symbol))
@@ -571,16 +576,16 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
             pct = float(position.unrealized_plpc or 0) * 100
             color = "green" if pnl >= 0 else "red"
             st.markdown(f"{position.qty} az. ~ :{color}[${pnl:,.2f} ({pct:+.2f}%)]")
-            qty = int(float(position.qty))
+            qty = float(position.qty)
             st.button("Vendi", key=f"sell_{symbol}", disabled=not trading_ok, on_click=_on_open_panel,
-                      args=(symbol, "sell", {f"sell_shares_{symbol}": max(1, qty)}))
+                      args=(symbol, "sell", {f"sell_shares_{symbol}": max(0.0001, qty)}))
         else:
             defaults = {}
             if trading_ok and "price" in data and math.isfinite(data["atr"]) and math.isfinite(data["bb_lower"]):
                 limit, stop, shares = order_plan(data, params)
                 target = limit + (data["atr"] * params.take_profit_atr_mult)
                 defaults = {f"buy_limit_{symbol}": max(0.0, limit), f"buy_stop_{symbol}": max(0.0, stop),
-                            f"buy_shares_{symbol}": max(1, math.floor(shares)), f"buy_confirm_{symbol}": False}
+                            f"buy_shares_{symbol}": shares, f"buy_confirm_{symbol}": False}
                 st.caption(f"🎯 Target ATR {params.take_profit_atr_mult:.1f}: ${target:,.2f}")
             st.button("Compra", key=f"buy_{symbol}", disabled=not defaults, on_click=_on_open_panel,
                       args=(symbol, "buy", defaults))
@@ -596,21 +601,37 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
     if panel == "buy" and trading_ok and position is None:
         render_buy_panel(client, symbol)
     elif panel == "sell" and trading_ok and position is not None:
-        render_sell_panel(client, symbol, int(float(position.qty)))
+        render_sell_panel(client, symbol, float(position.qty))
     if st.session_state["backtest_open"].get(symbol):
         render_backtest_panel(symbol)
 
 
-def render_watchlist(client, equity: float | None, positions: dict) -> None:
+def render_watchlist(
+    client,
+    equity: float | None,
+    positions: dict,
+    category_filter: str = "Tutti",
+    search_query: str = "",
+) -> None:
+    query = search_query.strip().casefold()
+    found = False
     for category, symbols in WATCHLIST.items():
+        if category_filter != "Tutti" and category != category_filter:
+            continue
+        visible_symbols = [symbol for symbol in symbols if query in symbol.casefold()]
+        if not visible_symbols:
+            continue
+        found = True
         signals = sum(compute_signal(st.session_state["live_data"].get(symbol, {}), get_ticker_params(symbol))
-                      for symbol in symbols)
-        with st.expander(f"{category} ~ {len(symbols)} titoli ~ {signals} segnali", expanded=True):
+                      for symbol in visible_symbols)
+        with st.expander(f"{category} ~ {len(visible_symbols)} titoli ~ {signals} segnali", expanded=True):
             head = st.columns(ROW_WIDTHS)
             for column, label in zip(head, ("Titolo / Prezzo", "ADX", "RSI", "Segnale", "Profilo / Bot", "Azioni")):
                 column.caption(label)
-            for symbol in symbols:
+            for symbol in visible_symbols:
                 render_ticker_row(symbol, client, equity, positions)
+    if not found:
+        st.info("Nessun ticker corrisponde ai filtri selezionati.")
 
 
 def load_account(client) -> tuple[float | None, dict, str | None]:
@@ -648,9 +669,11 @@ def main() -> None:
     equity, positions, account_error = load_account(client)
     render_header(client, account_error or connect_error, equity, positions)
 
-    controls = st.columns([3, 1, 1], vertical_alignment="center")
-    controls[1].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
-    controls[2].toggle("Auto-refresh 60s", key="auto_refresh")
+    controls = st.columns([2, 1.3, 1, 1], vertical_alignment="center")
+    search_query = controls[0].text_input("Cerca ticker", placeholder="Es. SPY, NVDA")
+    category_filter = controls[1].selectbox("Settore", ["Tutti", *WATCHLIST])
+    controls[2].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
+    controls[3].toggle("Auto-refresh", key="auto_refresh")
 
     if needs_refresh():
         progress = st.progress(0.0, text="Scarico i dati della watchlist…")
@@ -662,11 +685,11 @@ def main() -> None:
         if client is not None and equity is not None:
             run_bot_cycle(client, st.session_state, positions, equity)
         st.session_state["last_refresh"] = datetime.now()
-    controls[0].caption(f"Ultimo aggiornamento dati: {st.session_state['last_refresh']:%H:%M:%S}")
+    st.caption(f"Ultimo aggiornamento dati: {st.session_state['last_refresh']:%H:%M:%S}")
     if any(st.session_state["bot_enabled"].values()):
         st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
 
-    render_watchlist(client, equity, positions)
+    render_watchlist(client, equity, positions, category_filter, search_query)
 
     with st.expander("Log Bot", expanded=False):
         entries = st.session_state["bot_log"][-20:]
