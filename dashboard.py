@@ -330,7 +330,7 @@ def _display_symbol(alpaca_symbol: str) -> str:
 
 
 def get_active_symbols(selected_symbols: list[str]) -> list[str]:
-    return list(dict.fromkeys(symbol for symbol in selected_symbols  symbol))
+    return list(dict.fromkeys(symbol for symbol in selected_symbols if symbol))
 
 
 def prepare_ticker_selection(
