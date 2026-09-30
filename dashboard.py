@@ -330,7 +330,7 @@ def _display_symbol(alpaca_symbol: str) -> str:
 
 
 def get_active_symbols(selected_symbols: list[str]) -> list[str]:
-    return list(dict.fromkeys(symbol for symbol in selected_symbols if symbol))
+    return list(dict.fromkeys(symbol for symbol in selected_symbols  symbol))
 
 
 def prepare_ticker_selection(
@@ -1068,16 +1068,60 @@ def render_watchlist(
             render_ticker_row(symbol, client, equity, positions)
 
 
-def render_market_explorer(positions: dict) -> None:
+def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd.DataFrame:
+    state = st.session_state if state is None else state
+    rows = []
+    for symbol in symbols:
+        data = state.get("live_data", {}).get(symbol, {})
+        price = data.get("price")
+        previous_close = data.get("prev_close")
+        change = (
+            (price / previous_close - 1) * 100
+            if isinstance(price, (int, float)) and isinstance(previous_close, (int, float))
+            and math.isfinite(price) and math.isfinite(previous_close) and previous_close != 0
+            else float("nan")
+        )
+        position = positions.get(to_alpaca_symbol(symbol))
+        rows.append({
+            "Ticker": symbol,
+            "Prezzo ($)": price if isinstance(price, (int, float)) else float("nan"),
+            "Var. %": change,
+            "ADX": data.get("adx", float("nan")),
+            "RSI": data.get("rsi", float("nan")),
+            "Segnale": "Sì" if compute_signal(data, get_ticker_params(symbol, state)) else "No",
+            "Bot": "Attivo" if state.get("bot_enabled", {}).get(symbol, False) else "Spento",
+            "Posizione": "Aperta" if position is not None else "Assente",
+            "P&L ($)": float(position.unrealized_pl or 0) if position is not None else float("nan"),
+        })
+    return pd.DataFrame(rows)
+
+
+def paginate_market_radar(filtered: pd.DataFrame, page: int, page_size: int) -> tuple[pd.DataFrame, int]:
+    page_count = max(1, math.ceil(len(filtered) / page_size))
+    page = min(max(page, 0), page_count - 1)
+    start = page * page_size
+    return filtered.iloc[start:start + page_size].copy(), page_count
+
+
+def render_market_explorer(positions: dict, available_symbols: list[str]) -> list[str]:
+    st.subheader("Tutti i ticker")
+    selection_col, search_col, sector_col, type_col = st.columns([2.2, 1.2, 1.4, 1.2])
+    selected_symbols = selection_col.multiselect(
+        "I miei ticker",
+        options=available_symbols,
+        key="selected_tickers",
+        placeholder="Cerca e aggiungi ticker…",
+    )
+    search_query = search_col.text_input("Cerca nel radar", key="radar_search")
     radar_path = BOT_DIR / "market_radar.csv"
     if not radar_path.exists():
         st.info("Market radar non ancora generato. Esegui `python screener.py` per crearlo.")
-        return
+        return selected_symbols
     try:
         radar = pd.read_csv(radar_path)
     except Exception as exc:
         st.error(f"Impossibile leggere market_radar.csv: {exc}")
-        return
+        return selected_symbols
 
     required = {
         "Symbol", "Sector", "QuoteType", "MarketCap", "Close", "Volume_SMA20",
@@ -1087,34 +1131,66 @@ def render_market_explorer(positions: dict) -> None:
     missing = sorted(required - set(radar.columns))
     if missing:
         st.error(f"market_radar.csv non contiene: {', '.join(missing)}")
-        return
+        return selected_symbols
 
-    filters = st.columns([2, 1.4, 1.2, 1.2])
     sectors = sorted(radar["Sector"].dropna().astype(str).unique())
     quote_types = sorted(radar["QuoteType"].dropna().astype(str).unique())
-    selected_sectors = filters[0].multiselect("Settore", sectors, default=sectors)
-    selected_types = filters[1].multiselect("Tipo", quote_types, default=quote_types)
-    scalper_only = filters[2].toggle("🔥 Mostra solo segnali Scalper", key="radar_scalper_only")
-    trend_only = filters[3].toggle("🚀 Mostra solo segnali Trend", key="radar_trend_only")
+    selected_sectors = sector_col.multiselect("Settore", sectors, default=sectors, key="radar_sectors")
+    selected_types = type_col.multiselect("Tipo", quote_types, default=quote_types, key="radar_types")
+
+    filter_controls = st.columns([1.5, 1.5, 1.2, 1.2, 1])
+    scalper_only = filter_controls[0].toggle("Solo segnali Scalper", key="radar_scalper_only")
+    trend_only = filter_controls[1].toggle("Solo segnali Trend", key="radar_trend_only")
+    sort_by = filter_controls[2].selectbox(
+        "Ordina per",
+        ["Symbol", "MarketCap", "Close", "Volume_SMA20", "ADX", "ATR_pct", "RSI"],
+        format_func=lambda column: {"Symbol": "Ticker", "MarketCap": "Market Cap", "Close": "Prezzo",
+                                    "Volume_SMA20": "Volume", "ATR_pct": "ATR %"}.get(column, column),
+        key="radar_sort_by",
+    )
+    descending = filter_controls[3].toggle("Decrescente", key="radar_sort_desc", value=sort_by != "Symbol")
+    page_size = filter_controls[4].selectbox("Righe", [10, 25, 50, 100], index=1, key="radar_page_size")
 
     filtered = filter_market_radar(
         radar, selected_sectors, selected_types, scalper_only, trend_only
     )
+    if search_query.strip():
+        filtered = filtered[filtered["Symbol"].astype(str).str.contains(search_query.strip(), case=False, regex=False)]
+    filtered = filtered.sort_values(sort_by, ascending=not descending, na_position="last", kind="stable")
     if filtered.empty:
         st.info("Nessun ticker corrisponde ai filtri selezionati.")
-        return
+        return selected_symbols
+
+    page_key = "radar_page"
+    radar_page, page_count = paginate_market_radar(
+        filtered, int(st.session_state.get(page_key, 0)), page_size
+    )
+    st.session_state[page_key] = min(max(int(st.session_state.get(page_key, 0)), 0), page_count - 1)
+    previous_col, page_label_col, next_col = st.columns([1, 2, 1])
+    if previous_col.button("Precedente", disabled=st.session_state[page_key] == 0, key="radar_previous"):
+        st.session_state[page_key] -= 1
+    page_label_col.caption(f"Pagina {st.session_state[page_key] + 1} di {page_count} · {len(filtered)} ticker")
+    if next_col.button("Successiva", disabled=st.session_state[page_key] >= page_count - 1, key="radar_next"):
+        st.session_state[page_key] += 1
+    radar_page, _ = paginate_market_radar(filtered, st.session_state[page_key], page_size)
 
     active_tickers = set(st.session_state.get("active_tickers", []))
-    filtered["Attiva Bot"] = filtered["Symbol"].astype(str).isin(active_tickers)
-    filtered["Validatore_Scalper"] = filtered["Validatore_Scalper"].map({True: "🟢", False: "🔴"})
-    filtered["Validatore_Trend"] = filtered["Validatore_Trend"].map({True: "🟢", False: "🔴"})
-    visible_symbols = set(filtered["Symbol"].astype(str))
+    radar_page["Segnale"] = radar_page.apply(
+        lambda row: "Scalper + Trend" if row["Validatore_Scalper"] and row["Validatore_Trend"]
+        else "Scalper" if row["Validatore_Scalper"] else "Trend" if row["Validatore_Trend"] else "—",
+        axis=1,
+    )
+    radar_page["Attiva Bot"] = radar_page["Symbol"].astype(str).isin(active_tickers)
+    radar_page["Validatore_Scalper"] = radar_page["Validatore_Scalper"].map({True: "🟢", False: "🔴"})
+    radar_page["Validatore_Trend"] = radar_page["Validatore_Trend"].map({True: "🟢", False: "🔴"})
+    visible_symbols = set(radar_page["Symbol"].astype(str))
     edited = st.data_editor(
-        filtered,
+        radar_page,
         hide_index=True,
         use_container_width=True,
-        disabled=[column for column in filtered.columns if column != "Attiva Bot"],
+        disabled=[column for column in radar_page.columns if column != "Attiva Bot"],
         column_config={
+            "Segnale": st.column_config.TextColumn("Segnale"),
             "Attiva Bot": st.column_config.CheckboxColumn(
                 "Attiva Bot",
                 help="Aggiunge il ticker ai moduli del tab Controllo Bot.",
@@ -1129,7 +1205,7 @@ def render_market_explorer(positions: dict) -> None:
             "BB_lower": st.column_config.NumberColumn("BB Lower", format="$%.2f"),
             "SMA_200": st.column_config.NumberColumn("SMA 200", format="$%.2f"),
         },
-        key="market_radar_editor",
+        key=f"market_radar_editor_{st.session_state[page_key]}_{radar_page['Symbol'].iloc[0]}_{radar_page['Symbol'].iloc[-1]}",
     )
 
     updated_active = sync_market_editor_selection(
@@ -1142,6 +1218,7 @@ def render_market_explorer(positions: dict) -> None:
     if updated_active != active_tickers:
         st.session_state["active_tickers"] = sorted(updated_active)
         st.rerun(scope="app")
+    return selected_symbols
 
 
 def _radar_bool(value) -> bool:
@@ -1237,59 +1314,72 @@ def main() -> None:
     else:
         st.warning(connect_error or NO_KEYS_MESSAGE)
 
-    control_tab, explorer_tab = st.tabs(["Controllo Bot", "Esplora Mercato"])
-    with control_tab:
-        title_column, version_column = st.columns([5, 1], vertical_alignment="center")
-        title_column.title("📈 Trading Dashboard")
-        version_column.metric("Versione", APP_VERSION)
-        st.caption("Alpaca Paper Trading ~ strategia range: ADX < max, RSI < max, prezzo ≤ Bollinger inferiore "
-                   "(soglie e rischio dal profilo di ogni titolo)")
-        render_header(client, account_error or connect_error, equity, positions)
+    title_column, version_column = st.columns([5, 1], vertical_alignment="center")
+    title_column.title("📈 Trading Dashboard")
+    version_column.metric("Versione", APP_VERSION)
+    st.caption("Alpaca Paper Trading ~ strategia range: ADX < max, RSI < max, prezzo ≤ Bollinger inferiore "
+               "(soglie e rischio dal profilo di ogni titolo)")
+    render_header(client, account_error or connect_error, equity, positions)
 
-        selected_defaults, missing_required = prepare_ticker_selection(
-            available_symbols,
-            st.session_state.get("selected_tickers"),
-            positions,
-            st.session_state["bot_enabled"],
-            st.session_state["active_tickers"],
+    selected_defaults, missing_required = prepare_ticker_selection(
+        available_symbols,
+        st.session_state.get("selected_tickers"),
+        positions,
+        st.session_state["bot_enabled"],
+        st.session_state["active_tickers"],
+    )
+    st.session_state["selected_tickers"] = selected_defaults
+    if missing_required:
+        st.info(
+            "Ticker con bot attivo o posizione aperta mantenuti nella selezione: "
+            + ", ".join(missing_required)
         )
-        st.session_state["selected_tickers"] = selected_defaults
-        if missing_required:
-            st.info(
-                "Ticker con bot attivo o posizione aperta mantenuti nella selezione: "
-                + ", ".join(missing_required)
-            )
-        for symbol in selected_defaults:
-            st.session_state["bot_enabled"].setdefault(symbol, False)
-            st.session_state["profile"].setdefault(symbol, DEFAULT_PROFILE)
+    for symbol in selected_defaults:
+        st.session_state["bot_enabled"].setdefault(symbol, False)
+        st.session_state["profile"].setdefault(symbol, DEFAULT_PROFILE)
 
-        controls = st.columns([3, 1, 1], vertical_alignment="center")
-        selected_symbols = controls[0].multiselect(
-            "Cerca e aggiungi Ticker",
-            options=available_symbols,
-            key="selected_tickers",
-            placeholder="Cerca per simbolo…",
+    controls = st.columns([1, 1, 5], vertical_alignment="center")
+    controls[0].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
+    controls[1].toggle("Auto-refresh", key="auto_refresh")
+    selected_symbols = render_market_explorer(positions, available_symbols)
+    active_symbols = get_active_symbols(selected_symbols)
+    render_refresh_controller(client, equity, positions, active_symbols)
+
+    st.subheader("I miei ticker")
+    if active_symbols:
+        personal_table = build_watchlist_table(active_symbols, positions)
+        selected_row = st.dataframe(
+            personal_table,
+            hide_index=True,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="my_ticker_table",
+            column_config={
+                "Prezzo ($)": st.column_config.NumberColumn(format="$%.2f"),
+                "Var. %": st.column_config.NumberColumn(format="%.2f%%"),
+                "ADX": st.column_config.NumberColumn(format="%.2f"),
+                "RSI": st.column_config.NumberColumn(format="%.2f"),
+                "P&L ($)": st.column_config.NumberColumn(format="$%.2f"),
+            },
         )
-        controls[1].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
-        controls[2].toggle("Auto-refresh", key="auto_refresh")
-        active_symbols = get_active_symbols(selected_symbols)
-        render_refresh_controller(client, equity, positions, active_symbols)
-        st.subheader("Moduli attivi")
-        for symbol in active_symbols:
-            render_symbol_card(client, equity, symbol, positions)
-        if any(st.session_state["bot_enabled"].values()):
-            st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
+        selected_rows = selected_row.selection.rows
+        if selected_rows:
+            detail_symbol = personal_table.iloc[selected_rows[0]]["Ticker"]
+            st.markdown(f"### Dettaglio {detail_symbol}")
+            render_symbol_card(client, equity, detail_symbol, positions)
+    else:
+        st.info("Seleziona i ticker dalla tabella superiore o attivali nella colonna Attiva Bot.")
 
-        with st.expander("Log Bot", expanded=False):
-            entries = st.session_state["bot_log"][-20:]
-            if entries:
-                st.code("\n".join(reversed(entries)), language=None)
-            else:
-                st.caption("Nessuna azione registrata.")
+    if any(st.session_state["bot_enabled"].values()):
+        st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
 
-    with explorer_tab:
-        st.subheader("Market Explorer")
-        render_market_explorer(positions)
+    with st.expander("Log Bot", expanded=False):
+        entries = st.session_state["bot_log"][-20:]
+        if entries:
+            st.code("\n".join(reversed(entries)), language=None)
+        else:
+            st.caption("Nessuna azione registrata.")
 
 if __name__ == "__main__":
     main()

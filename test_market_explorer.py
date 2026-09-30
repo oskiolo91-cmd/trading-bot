@@ -1,4 +1,5 @@
 import pandas as pd
+from types import SimpleNamespace
 
 import dashboard
 
@@ -19,6 +20,33 @@ def test_market_radar_filters_sector_type_and_combined_validators():
     )
 
     assert filtered["Symbol"].tolist() == ["A"]
+
+
+def test_market_radar_pagination_returns_page_and_total_pages():
+    radar = pd.DataFrame({"Symbol": ["A", "B", "C", "D", "E"]})
+
+    page, page_count = dashboard.paginate_market_radar(radar, page=1, page_size=2)
+
+    assert page["Symbol"].tolist() == ["C", "D"]
+    assert page_count == 3
+
+
+def test_personal_ticker_table_includes_live_metrics_signal_and_position_pnl():
+    state = {
+        "live_data": {
+            "SPY": {"price": 90.0, "prev_close": 100.0, "adx": 10.0, "rsi": 20.0, "bb_lower": 95.0},
+        },
+        "bot_enabled": {"SPY": True},
+        "profile": {},
+    }
+    positions = {"SPY": SimpleNamespace(unrealized_pl=2.5)}
+
+    table = dashboard.build_watchlist_table(["SPY"], positions, state)
+
+    assert round(table.loc[0, "Var. %"], 2) == -10.0
+    assert table.loc[0, "Segnale"] == "Sì"
+    assert table.loc[0, "Bot"] == "Attivo"
+    assert table.loc[0, "P&L ($)"] == 2.5
 
 
 def test_editor_selection_preserves_active_symbols_hidden_by_filters():
