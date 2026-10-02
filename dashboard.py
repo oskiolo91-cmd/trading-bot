@@ -852,25 +852,36 @@ def rsi_label(rsi: float, params: StrategyParams = PARAMS) -> str:
 
 
 def render_header(client, account_error: str | None, equity: float | None, positions: dict) -> None:
-    cols = st.columns(4)
+    cols = st.columns(5)
     bots = sum(bool(on) for on in st.session_state["bot_enabled"].values())
     if client is None or equity is None:
         cols[0].metric("Account Equity", "—")
-        cols[1].metric("Posizioni aperte", "—")
-        cols[2].metric("P&L oggi (non realizzato)", "—")
-        cols[3].metric("Bot attivi", bots)
+        cols[1].metric("Capitale investito", "—")
+        cols[2].metric("Posizioni aperte", "—")
+        cols[3].metric("P&L oggi (non realizzato)", "—")
+        cols[4].metric("Bot attivi", bots)
         st.warning(account_error or NO_KEYS_MESSAGE)
         return
     today_pl = 0.0
+    invested_capital = 0.0
     for position in positions.values():
         value = getattr(position, "unrealized_intraday_pl", None)
         if value is None:
             value = getattr(position, "unrealized_pl", 0)
         today_pl += float(value or 0)
+        cost_basis = _number_or_nan(getattr(position, "cost_basis", None))
+        if not math.isfinite(cost_basis):
+            entry_price = _number_or_nan(getattr(position, "avg_entry_price", None))
+            quantity = _number_or_nan(getattr(position, "qty", None))
+            if math.isfinite(entry_price) and math.isfinite(quantity):
+                cost_basis = entry_price * quantity
+        if math.isfinite(cost_basis):
+            invested_capital += abs(cost_basis)
     cols[0].metric("Account Equity", f"${equity:,.2f}")
-    cols[1].metric("Posizioni aperte", len(positions))
-    cols[2].metric("P&L oggi (non realizzato)", f"${today_pl:,.2f}", delta=f"{today_pl:,.2f}")
-    cols[3].metric("Bot attivi", bots)
+    cols[1].metric("Capitale investito", f"${invested_capital:,.2f}")
+    cols[2].metric("Posizioni aperte", len(positions))
+    cols[3].metric("P&L oggi (non realizzato)", f"${today_pl:,.2f}", delta=f"{today_pl:,.2f}")
+    cols[4].metric("Bot attivi", bots)
     if account_error:
         st.warning(account_error)
 
