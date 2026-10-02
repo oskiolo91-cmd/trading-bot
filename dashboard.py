@@ -1348,7 +1348,13 @@ def main() -> None:
     controls[0].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
     controls[1].toggle("Auto-refresh", key="auto_refresh")
     selected_symbols = render_market_explorer(positions, available_symbols)
-    active_symbols = get_active_symbols(selected_symbols)
+    active_symbols = get_active_symbols(
+        [
+            *[symbol for symbol, enabled in st.session_state["bot_enabled"].items() if enabled],
+            *st.session_state.get("active_tickers", []),
+            *selected_symbols,
+        ]
+    )
     render_refresh_controller(client, equity, positions, active_symbols)
 
     if active_symbols:
@@ -1402,7 +1408,7 @@ def main() -> None:
         st.markdown(f"### Dettaglio {detail_symbol}")
         render_symbol_card(client, equity, detail_symbol, positions)
     else:
-        st.info("Seleziona i ticker dalla tabella superiore o attivali nella colonna Attiva Bot.")
+        st.info("Nessun ticker attivo. Attiva un bot o un ticker dalla tabella radar.")
 
     if any(st.session_state["bot_enabled"].values()):
         st.info("🤖 I bot girano solo mentre questa pagina è aperta nel browser.")
