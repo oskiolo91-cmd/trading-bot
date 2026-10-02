@@ -100,6 +100,23 @@ def test_fetch_yahoo_metadata_retries_after_transient_yahoo_error(monkeypatch):
     assert attempts["count"] == 2
 
 
+def test_fetch_yahoo_metadata_uses_fast_info_fallback_when_get_info_fails(monkeypatch):
+    class FakeTicker:
+        fast_info = type("FastInfo", (), {"market_cap": 456_000_000})()
+
+        def get_info(self):
+            raise RuntimeError("Yahoo blocked request")
+
+    monkeypatch.setattr(screener.yf, "Ticker", lambda symbol: FakeTicker())
+    monkeypatch.setattr(screener.time_module, "sleep", lambda *_args, **_kwargs: None)
+
+    metadata = screener._fetch_yahoo_metadata("AAPL")
+
+    assert metadata["Sector"] == "Unknown"
+    assert metadata["QuoteType"] == "Equity"
+    assert metadata["MarketCap"] == 456_000_000
+
+
 def test_generate_market_radar_keeps_cached_sector_metadata_on_refresh(tmp_path, monkeypatch):
     dates = pd.date_range("2025-01-01", periods=220, freq="B", tz="UTC")
     close = pd.Series(np.linspace(100, 120, len(dates)), index=dates)

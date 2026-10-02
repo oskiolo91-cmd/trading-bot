@@ -357,18 +357,37 @@ def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
         except Exception as exc:
             last_error = exc
             LOG.warning("Metadata fetch failed for %s (attempt %s/3): %s", symbol, attempt + 1, exc)
+
+        try:
+            fast_info = getattr(ticker, "fast_info", None)
+            if fast_info is not None:
+                merged = dict(info)
+                market_cap = getattr(fast_info, "market_cap", None)
+                if market_cap is not None and "marketCap" not in merged:
+                    merged["marketCap"] = market_cap
+                quote_type = getattr(fast_info, "quote_type", None)
+                if quote_type is not None and "quoteType" not in merged:
+                    merged["quoteType"] = quote_type
+                if merged:
+                    info = merged
+                    break
+        except Exception:
+            pass
+
         if attempt < 2:
             time_module.sleep(0.5 * (attempt + 1))
 
     if not info and last_error is not None:
-        LOG.warning("Using empty metadata fallback for %s after repeated Yahoo failures", symbol)
+        LOG.warning("Using fallback metadata for %s after repeated Yahoo failures", symbol)
 
     raw_quote_type = str(info.get("quoteType") or "").upper()
-    quote_type = "ETF" if raw_quote_type == "ETF" else "Equity" if raw_quote_type in {"EQUITY", ""} else raw_quote_type
+    quote_type = "ETF" if raw_quote_type == "ETF" else "Equity" if raw_quote_type in {"EQUITY", "", "STOCK"} else raw_quote_type
     market_cap = info.get("marketCap")
-    sector = info.get("sector")
-    if not sector:
-        sector = info.get("industry") or "Unknown"
+    if market_cap is None:
+        fast_info = getattr(ticker, "fast_info", None)
+        if fast_info is not None:
+            market_cap = getattr(fast_info, "market_cap", None)
+    sector = info.get("sector") or info.get("industry") or "Unknown"
 
     return {
         "Sector": str(sector),
