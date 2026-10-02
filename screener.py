@@ -89,6 +89,76 @@ def _yahoo_symbol(symbol: str) -> str:
     return symbol.replace(".", "-")
 
 
+def _metadata_value_is_missing(value: Any) -> bool:
+    if value is None or value is pd.NA:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    text = str(value).strip()
+    return text == "" or text.lower() == "unknown"
+
+
+def _read_cached_market_radar_metadata(output_path: str | Path) -> dict[str, dict[str, Any]]:
+    path = Path(output_path)
+    if not path.exists():
+        return {}
+    try:
+        cached = pd.read_csv(path)
+    except Exception:
+        return {}
+    if cached.empty:
+        return {}
+
+    metadata_by_symbol: dict[str, dict[str, Any]] = {}
+    for row in cached.to_dict("records"):
+        symbol = str(row.get("Symbol", "")).strip()
+        if not symbol:
+            continue
+        sector = row.get("Sector")
+        quote_type = row.get("QuoteType")
+        market_cap = row.get("MarketCap")
+        market_cap_value = None
+        if market_cap is not None and not _metadata_value_is_missing(market_cap):
+            try:
+                market_cap_value = int(market_cap)
+            except (TypeError, ValueError):
+                market_cap_value = None
+        metadata_by_symbol[symbol] = {
+            "Sector": str(sector) if not _metadata_value_is_missing(sector) else "Unknown",
+            "QuoteType": str(quote_type) if not _metadata_value_is_missing(quote_type) else "Equity",
+            "MarketCap": market_cap_value,
+        }
+    return metadata_by_symbol
+
+
+def _merge_metadata_with_cache(cached: dict[str, Any], fresh: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(cached or {})
+    for field, fallback in {
+        "Sector": "Unknown",
+        "QuoteType": "Equity",
+        "MarketCap": None,
+    }.items():
+        value = fresh.get(field)
+        if field == "MarketCap" and value is not None:
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = None
+        if field in {"Sector", "QuoteType"} and _metadata_value_is_missing(value):
+            value = merged.get(field) or fallback
+        if field == "MarketCap" and _metadata_value_is_missing(value):
+            value = merged.get(field)
+        if value is None and field == "MarketCap":
+            merged[field] = None
+        elif not _metadata_value_is_missing(value):
+            merged[field] = value
+        elif field in merged and not _metadata_value_is_missing(merged.get(field)):
+            continue
+        else:
+            merged[field] = fallback
+    return merged
+
+
 def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
     ticker = yf.Ticker(_yahoo_symbol(symbol))
     info: dict[str, Any] = {}
@@ -180,6 +250,7 @@ def generate_market_radar(
     if not symbols:
         raise ValueError("At least one ticker is required")
 
+    cached_metadata = _read_cached_market_radar_metadata(output_path)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=400)
     metadata_by_symbol: dict[str, dict[str, Any]] = {}
@@ -187,11 +258,20 @@ def generate_market_radar(
         futures = {executor.submit(_fetch_yahoo_metadata, symbol): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]
+            previous = cached_metadata.get(symbol, {})
             try:
-                metadata_by_symbol[symbol] = future.result()
+                fresh = future.result()
             except Exception:
                 LOG.exception("Could not load metadata for %s", symbol)
-                metadata_by_symbol[symbol] = {"Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None}
+                fresh = {"Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None}
+            metadata_by_symbol[symbol] = _merge_metadata_with_cache(previous, fresh)
+
+    for symbol in symbols:
+        metadata_by_symbol.setdefault(symbol, cached_metadata.get(symbol, {
+            "Sector": "Unknown",
+            "QuoteType": "Equity",
+            "MarketCap": None,
+        }))
 
     if trading_client is None:
         from live_trader import get_alpaca_client

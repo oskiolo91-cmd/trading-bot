@@ -98,3 +98,52 @@ def test_fetch_yahoo_metadata_retries_after_transient_yahoo_error(monkeypatch):
     assert metadata["QuoteType"] == "Equity"
     assert metadata["MarketCap"] == 123_000_000
     assert attempts["count"] == 2
+
+
+def test_generate_market_radar_keeps_cached_sector_metadata_on_refresh(tmp_path, monkeypatch):
+    dates = pd.date_range("2025-01-01", periods=220, freq="B", tz="UTC")
+    close = pd.Series(np.linspace(100, 120, len(dates)), index=dates)
+    frame = pd.DataFrame({
+        "Open": close - 0.1,
+        "High": close + 0.5,
+        "Low": close - 0.5,
+        "Close": close,
+        "Adj Close": close,
+        "Volume": 100_000,
+    }, index=dates)
+
+    output = tmp_path / "market_radar.csv"
+    pd.DataFrame([
+        {
+            "Symbol": "AAPL",
+            "Sector": "Technology",
+            "QuoteType": "Equity",
+            "MarketCap": 123_000_000,
+            "Close": 100.0,
+            "Volume_SMA20": 1000,
+            "ADX": 20.0,
+            "ATR_pct": 1.0,
+            "RSI": 30.0,
+            "BB_lower": 90.0,
+            "SMA_200": 95.0,
+            "Validatore_Scalper": True,
+            "Validatore_Trend": True,
+        }
+    ]).to_csv(output, index=False)
+
+    monkeypatch.setattr(screener, "_fetch_yahoo_metadata", lambda symbol: {
+        "Sector": "Unknown",
+        "QuoteType": "Equity",
+        "MarketCap": None,
+    })
+    monkeypatch.setattr(screener, "fetch_daily_bars", lambda symbols, **kwargs: {symbol: frame for symbol in symbols})
+
+    class FakeTradingClient:
+        def get_clock(self):
+            return type("Clock", (), {"is_open": False})()
+
+    screener.generate_market_radar(["AAPL"], output, trading_client=FakeTradingClient(), data_client=object())
+    stored = pd.read_csv(output)
+
+    assert stored.loc[0, "Sector"] == "Technology"
+    assert stored.loc[0, "QuoteType"] == "Equity"
