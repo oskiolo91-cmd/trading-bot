@@ -73,3 +73,28 @@ def test_radar_exports_schema_and_metadata(tmp_path, monkeypatch):
     assert stored.loc[0, "QuoteType"] == "Equity"
     assert stored.loc[0, "Symbol"] == "SPY"
     assert received_clients == [data_client]
+
+
+def test_fetch_yahoo_metadata_retries_after_transient_yahoo_error(monkeypatch):
+    attempts = {"count": 0}
+
+    class FakeTicker:
+        def get_info(self):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("temporary Yahoo issue")
+            return {
+                "sector": "Technology",
+                "quoteType": "EQUITY",
+                "marketCap": 123_000_000,
+            }
+
+    monkeypatch.setattr(screener.yf, "Ticker", lambda symbol: FakeTicker())
+    monkeypatch.setattr(screener.time_module, "sleep", lambda *_args, **_kwargs: None)
+
+    metadata = screener._fetch_yahoo_metadata("AAPL")
+
+    assert metadata["Sector"] == "Technology"
+    assert metadata["QuoteType"] == "Equity"
+    assert metadata["MarketCap"] == 123_000_000
+    assert attempts["count"] == 2

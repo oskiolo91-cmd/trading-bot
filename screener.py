@@ -6,6 +6,7 @@ import asyncio
 import argparse
 import logging
 import math
+import time as time_module
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -89,16 +90,34 @@ def _yahoo_symbol(symbol: str) -> str:
 
 
 def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
-    try:
-        info = yf.Ticker(_yahoo_symbol(symbol)).get_info()
-    except Exception as exc:
-        LOG.warning("Metadata unavailable for %s: %s", symbol, exc)
-        info = {}
+    ticker = yf.Ticker(_yahoo_symbol(symbol))
+    info: dict[str, Any] = {}
+    last_error: Exception | None = None
+
+    for attempt in range(3):
+        try:
+            candidate = ticker.get_info() or {}
+            if candidate:
+                info = candidate
+                break
+        except Exception as exc:
+            last_error = exc
+            LOG.warning("Metadata fetch failed for %s (attempt %s/3): %s", symbol, attempt + 1, exc)
+        if attempt < 2:
+            time_module.sleep(0.5 * (attempt + 1))
+
+    if not info and last_error is not None:
+        LOG.warning("Using empty metadata fallback for %s after repeated Yahoo failures", symbol)
+
     raw_quote_type = str(info.get("quoteType") or "").upper()
     quote_type = "ETF" if raw_quote_type == "ETF" else "Equity" if raw_quote_type in {"EQUITY", ""} else raw_quote_type
     market_cap = info.get("marketCap")
+    sector = info.get("sector")
+    if not sector:
+        sector = info.get("industry") or "Unknown"
+
     return {
-        "Sector": info.get("sector") or "Unknown",
+        "Sector": str(sector),
         "QuoteType": quote_type,
         "MarketCap": int(market_cap) if market_cap is not None else None,
     }
