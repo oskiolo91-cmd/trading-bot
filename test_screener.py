@@ -147,3 +147,35 @@ def test_generate_market_radar_keeps_cached_sector_metadata_on_refresh(tmp_path,
 
     assert stored.loc[0, "Sector"] == "Technology"
     assert stored.loc[0, "QuoteType"] == "Equity"
+
+
+def test_generate_market_radar_creates_missing_output_directory(tmp_path, monkeypatch):
+    dates = pd.date_range("2025-01-01", periods=220, freq="B", tz="UTC")
+    close = pd.Series(np.linspace(100, 120, len(dates)), index=dates)
+    frame = pd.DataFrame({
+        "Open": close - 0.1,
+        "High": close + 0.5,
+        "Low": close - 0.5,
+        "Close": close,
+        "Adj Close": close,
+        "Volume": 100_000,
+    }, index=dates)
+
+    output = tmp_path / "subdir" / "market_radar.csv"
+
+    monkeypatch.setattr(screener, "_fetch_yahoo_metadata", lambda symbol: {
+        "Sector": "Technology",
+        "QuoteType": "Equity",
+        "MarketCap": 123_000_000,
+    })
+    monkeypatch.setattr(screener, "fetch_daily_bars", lambda symbols, **kwargs: {symbol: frame for symbol in symbols})
+
+    class FakeTradingClient:
+        def get_clock(self):
+            return type("Clock", (), {"is_open": False})()
+
+    screener.generate_market_radar(["AAPL"], output, trading_client=FakeTradingClient(), data_client=object())
+
+    assert output.exists()
+    stored = pd.read_csv(output)
+    assert stored.loc[0, "Sector"] == "Technology"

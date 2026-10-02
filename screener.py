@@ -313,6 +313,8 @@ def generate_market_radar(
                 LOG.warning("Skipping %s from market radar: %s", symbol, exc)
 
     radar = pd.DataFrame(rows, columns=RADAR_COLUMNS)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     radar.to_csv(output_path, index=False)
     return radar
 
