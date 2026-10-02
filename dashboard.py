@@ -20,7 +20,7 @@ import streamlit as st
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, QueryOrderStatus
-from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.requests import GetAssetsRequest, GetOrdersRequest
 
 
 BOT_DIR = Path(__file__).resolve().parent
@@ -75,7 +75,12 @@ def filter_fractional_assets(assets) -> list[str]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_fractional_asset_symbols(_trading_client, credential_scope: str) -> list[str]:
-    return filter_fractional_assets(_trading_client.get_all_assets())
+    asset_filter = GetAssetsRequest(
+        status=AssetStatus.ACTIVE,
+        asset_class=AssetClass.US_EQUITY,
+        attributes="fractionable",
+    )
+    return filter_fractional_assets(_trading_client.get_all_assets(filter=asset_filter))
 
 
 def get_fractional_asset_symbols(trading_client, api_key: str, secret_key: str) -> list[str]:

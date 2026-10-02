@@ -60,9 +60,11 @@ def test_asset_filter_keeps_only_active_tradable_fractional_equities():
 def test_fractional_asset_fetch_is_cached_once_per_account():
     class FakeClient:
         calls = 0
+        asset_filter = None
 
-        def get_all_assets(self):
+        def get_all_assets(self, filter):
             self.calls += 1
+            self.asset_filter = filter
             return [SimpleNamespace(
                 symbol="QQQ", status=AssetStatus.ACTIVE, tradable=True,
                 fractionable=True, asset_class=AssetClass.US_EQUITY,
@@ -76,6 +78,9 @@ def test_fractional_asset_fetch_is_cached_once_per_account():
 
     assert first == second == ["QQQ"]
     assert client.calls == 1
+    assert client.asset_filter.status == AssetStatus.ACTIVE
+    assert client.asset_filter.asset_class == AssetClass.US_EQUITY
+    assert client.asset_filter.attributes == "fractionable"
 
 
 def test_selection_defaults_and_keeps_active_bot_and_positions_selected():
