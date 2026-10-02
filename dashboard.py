@@ -661,10 +661,16 @@ def connect_alpaca() -> tuple[object | None, str | None]:
         return None, f"Connessione ad Alpaca non riuscita: {exc}"
 
 
-def order_plan(data: dict, params: StrategyParams) -> tuple[float, float, float]:
+def order_plan(
+    data: dict,
+    params: StrategyParams,
+    entry_price_override: float | None = None,
+) -> tuple[float, float, float]:
     """Return a fixed-budget fractional quantity, limit, and ATR stop."""
-    limit = round(data["bb_lower"], 2)
-    stop = round(data["bb_lower"] - params.stop_loss_atr_mult * data["atr"], 2)
+    override = _number_or_nan(entry_price_override)
+    entry_price = override if math.isfinite(override) and override > 0 else data["bb_lower"]
+    limit = round(entry_price, 2)
+    stop = round(limit - params.stop_loss_atr_mult * data["atr"], 2)
     quantity = round(params.trade_budget_usd / limit, 4) if limit > 0 else 0.0
     return limit, stop, quantity
 
@@ -743,7 +749,8 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
                 continue
             if any(order.side == OrderSide.BUY for order in _open_orders(client, alpaca_symbol)):
                 continue
-            limit, stop, shares = order_plan(data, params)
+            entry_override = state.get("bot_entry_price_overrides", {}).get(symbol)
+            limit, stop, shares = order_plan(data, params, entry_override)
             last_buy[symbol] = today
             if shares <= 0 or not 0 < stop < limit:
                 add_log(state, f"🤖 {symbol}: segnale attivo ma ordine non dimensionabile")
@@ -1288,11 +1295,32 @@ def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd
         if position is not None and not math.isfinite(high_water_mark):
             high_water_mark = entry_price
         dynamic_stop = trailing_stop_price(high_water_mark, params.trailing_pct)
+        bot_enabled = bool(state.get("bot_enabled", {}).get(symbol, False))
+        entry_override = _number_or_nan(state.get("bot_entry_price_overrides", {}).get(symbol))
+        if math.isfinite(entry_override) and entry_override > 0:
+            bot_entry_price = entry_override
+            bot_entry_status = "Prossimo ingresso" if position is not None else "Personalizzato"
+        elif position is not None:
+            bot_entry_price = entry_price
+            bot_entry_status = "Eseguito"
+        elif bot_enabled:
+            entry_inputs = (data.get("atr"), data.get("bb_lower"))
+            if all(isinstance(value, (int, float)) and math.isfinite(value) for value in entry_inputs):
+                bot_entry_price, _, _ = order_plan(data, params)
+                bot_entry_status = "Previsto"
+            else:
+                bot_entry_price = float("nan")
+                bot_entry_status = "In attesa dati"
+        else:
+            bot_entry_price = float("nan")
+            bot_entry_status = "Bot spento"
         rows.append({
             "Ticker": symbol,
             "Prezzo attuale ($)": price,
             "Var. giornaliera %": change,
             "Prezzo medio acquisto ($)": entry_price,
+            "Prezzo ingresso bot ($)": bot_entry_price,
+            "Stato ingresso bot": bot_entry_status,
             "Quantità": quantity,
             "Capitale investito ($)": invested,
             "Valore attuale ($)": current_value,
@@ -1835,7 +1863,7 @@ def main() -> None:
                 column for column in personal_table.columns
                 if column not in {
                     "Bot", "Ticker", "Profilo di Rischio", "Trailing stop %",
-                    "Prezzo Massimo Raggiunto ($)",
+                    "Prezzo Massimo Raggiunto ($)", "Prezzo ingresso bot ($)",
                 }
             ],
             key="my_ticker_table",
@@ -1867,6 +1895,13 @@ def main() -> None:
                 "Prezzo attuale ($)": st.column_config.NumberColumn(format="$%.2f"),
                 "Var. giornaliera %": st.column_config.NumberColumn(format="%.2f%%"),
                 "Prezzo medio acquisto ($)": st.column_config.NumberColumn(format="$%.2f"),
+                "Prezzo ingresso bot ($)": st.column_config.NumberColumn(
+                    format="$%.2f",
+                    min_value=0.01,
+                    step=0.01,
+                    help="Ingresso eseguito o limite personalizzato per il prossimo ordine bot.",
+                ),
+                "Stato ingresso bot": st.column_config.TextColumn("Stato ingresso bot"),
                 "Quantità": st.column_config.NumberColumn(format="%.4f"),
                 "Capitale investito ($)": st.column_config.NumberColumn(format="$%.2f"),
                 "Valore attuale ($)": st.column_config.NumberColumn(format="$%.2f"),
@@ -1903,6 +1938,14 @@ def main() -> None:
                 symbol,
                 row["Prezzo Massimo Raggiunto ($)"],
             )
+            requested_entry = _number_or_nan(row["Prezzo ingresso bot ($)"])
+            original_entry = _number_or_nan(original_row["Prezzo ingresso bot ($)"])
+            entry_overrides = st.session_state.setdefault("bot_entry_price_overrides", {})
+            if math.isfinite(requested_entry) and requested_entry > 0:
+                if not math.isfinite(original_entry) or not math.isclose(requested_entry, original_entry):
+                    entry_overrides[symbol] = requested_entry
+            elif not math.isfinite(requested_entry):
+                entry_overrides.pop(symbol, None)
         active_tickers = set(st.session_state.get("active_tickers", []))
         active_tickers = {symbol for symbol in active_tickers if symbol in set(edited_personal["Ticker"].astype(str))} | set(
             edited_personal[edited_personal["Bot"] == True]["Ticker"].astype(str)

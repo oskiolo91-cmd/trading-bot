@@ -131,6 +131,41 @@ def test_watchlist_table_shows_profile_high_water_mark_and_derived_stop():
     assert table.loc[0, "Trailing stop %"] == 6.0
     assert table.loc[0, "Prezzo Massimo Raggiunto ($)"] == 120.0
     assert round(table.loc[0, "Stop Dinamico ($)"], 2) == 112.8
+    assert table.loc[0, "Prezzo ingresso bot ($)"] == 100.0
+    assert table.loc[0, "Stato ingresso bot"] == "Eseguito"
+
+
+def test_active_bot_without_position_shows_planned_entry_price():
+    state = {
+        "live_data": {"NVDA": {"price": 94.0, "prev_close": 93.0, "atr": 2.0, "bb_lower": 95.0}},
+        "bot_enabled": {"NVDA": True},
+        "profile": {},
+    }
+
+    table = dashboard.build_watchlist_table(["NVDA"], {}, state)
+
+    assert table.loc[0, "Prezzo ingresso bot ($)"] == 95.0
+    assert table.loc[0, "Stato ingresso bot"] == "Previsto"
+
+
+def test_bot_entry_value_is_editable_and_override_changes_next_order_plan():
+    state = {
+        "live_data": {"NVDA": {"price": 94.0, "prev_close": 93.0, "atr": 2.0, "bb_lower": 95.0}},
+        "bot_enabled": {"NVDA": True},
+        "profile": {},
+        "bot_entry_price_overrides": {"NVDA": 90.0},
+    }
+
+    table = dashboard.build_watchlist_table(["NVDA"], {}, state)
+    limit, stop, shares = dashboard.order_plan(
+        state["live_data"]["NVDA"],
+        dashboard.get_ticker_params("NVDA", state),
+        entry_price_override=state["bot_entry_price_overrides"]["NVDA"],
+    )
+
+    assert table.loc[0, "Prezzo ingresso bot ($)"] == 90.0
+    assert table.loc[0, "Stato ingresso bot"] == "Personalizzato"
+    assert (limit, stop, shares) == (90.0, 86.0, 1.1111)
 
 
 def test_manual_trailing_percentage_overrides_profile_and_drives_dynamic_stop():
