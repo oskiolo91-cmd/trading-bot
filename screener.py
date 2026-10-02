@@ -21,6 +21,8 @@ from backtest import download_daily_bars, load_ohlcv_csv, prepare_data
 from macro_filter import has_risk_off_within
 
 LOG = logging.getLogger(__name__)
+# The local CSV is treated as a lightweight database: the dashboard reads it immediately and the
+# background worker updates it asynchronously as data is fetched for each ticker.
 MARKET_RADAR_PATH = Path(__file__).resolve().with_name("market_radar.csv")
 RADAR_COLUMNS = [
     "Symbol", "Sector", "QuoteType", "MarketCap", "Close", "Volume_SMA20",

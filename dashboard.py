@@ -1249,6 +1249,9 @@ def paginate_market_radar(filtered: pd.DataFrame, page: int, page_size: int) -> 
 
 def render_market_explorer(positions: dict, available_symbols: list[str], trading_client=None) -> list[str]:
     st.subheader("Tutti i ticker")
+    # CSV-backed bootstrap: if the local market_radar.csv is missing, the dashboard starts a background
+    # worker that fills the file progressively without blocking the app UI.
+    st.session_state.setdefault("market_radar_generation_started", False)
     st.session_state["market_radar_visible_symbols"] = []
     search_col, sector_col, type_col = st.columns([1.6, 1.4, 1.2])
     selected_symbols = []
