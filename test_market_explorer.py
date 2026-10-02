@@ -168,7 +168,16 @@ def test_build_market_radar_table_adds_signal_and_activation_flags():
         },
     ])
 
-    table = dashboard.build_market_radar_table(radar, {"A"})
+    table = dashboard.build_market_radar_table(
+        radar,
+        {"A"},
+        {
+            "A": {"price": 105.0, "prev_close": 100.0},
+            "B": {"price": 198.0, "prev_close": 200.0},
+        },
+    )
 
     assert table["Attiva Bot"].tolist() == [True, False]
     assert table["Segnale"].tolist() == ["Scalper + Trend", "—"]
+    assert table["Prezzo dinamico ($)"].tolist() == [105.0, 198.0]
+    assert [round(value, 2) for value in table["Var. dinamica %"]] == [5.0, -1.0]

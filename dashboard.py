@@ -1188,9 +1188,28 @@ def _number_or_nan(value) -> float:
     return number if math.isfinite(number) else float("nan")
 
 
-def build_market_radar_table(radar: pd.DataFrame, active_tickers: set[str] | list[str] | None = None) -> pd.DataFrame:
+def build_market_radar_table(
+    radar: pd.DataFrame,
+    active_tickers: set[str] | list[str] | None = None,
+    live_data: dict[str, dict] | None = None,
+) -> pd.DataFrame:
     table = radar.copy()
     active = set(active_tickers or [])
+    live_data = live_data or {}
+    live_prices = []
+    live_changes = []
+    for symbol in table["Symbol"].astype(str):
+        data = live_data.get(symbol, {})
+        price = _number_or_nan(data.get("price"))
+        previous_close = _number_or_nan(data.get("prev_close"))
+        live_prices.append(price)
+        live_changes.append(
+            (price / previous_close - 1) * 100
+            if math.isfinite(price) and math.isfinite(previous_close) and previous_close != 0
+            else float("nan")
+        )
+    table["Prezzo dinamico ($)"] = live_prices
+    table["Var. dinamica %"] = live_changes
     table["Segnale"] = table.apply(
         lambda row: "Scalper + Trend" if bool(row.get("Validatore_Scalper")) and bool(row.get("Validatore_Trend"))
         else "Scalper" if bool(row.get("Validatore_Scalper"))
@@ -1213,6 +1232,7 @@ def paginate_market_radar(filtered: pd.DataFrame, page: int, page_size: int) -> 
 
 def render_market_explorer(positions: dict, available_symbols: list[str], trading_client=None) -> list[str]:
     st.subheader("Tutti i ticker")
+    st.session_state["market_radar_visible_symbols"] = []
     search_col, sector_col, type_col = st.columns([1.6, 1.4, 1.2])
     selected_symbols = []
     search_query = search_col.text_input("Cerca nel radar", key="radar_search")
@@ -1296,9 +1316,14 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     if next_col.button("Successiva", disabled=st.session_state[page_key] >= page_count - 1, key="radar_next"):
         st.session_state[page_key] += 1
     radar_page, _ = paginate_market_radar(filtered, st.session_state[page_key], page_size)
+    st.session_state["market_radar_visible_symbols"] = radar_page["Symbol"].astype(str).tolist()
 
     active_tickers = set(st.session_state.get("active_tickers", []))
-    radar_table = build_market_radar_table(radar_page, active_tickers)
+    radar_table = build_market_radar_table(
+        radar_page,
+        active_tickers,
+        st.session_state.get("live_data", {}),
+    )
     st.session_state["market_radar_detail_table"] = radar_table
     visible_symbols = set(radar_table["Symbol"].astype(str))
     edited = st.data_editor(
@@ -1315,6 +1340,8 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
             ),
             "MarketCap": st.column_config.NumberColumn("Market Cap", format="$%d"),
             "Close": st.column_config.NumberColumn("Close", format="$%.2f"),
+            "Prezzo dinamico ($)": st.column_config.NumberColumn("Prezzo attuale", format="$%.2f"),
+            "Var. dinamica %": st.column_config.NumberColumn("Var. oggi", format="%.2f%%"),
             "Volume_SMA20": st.column_config.NumberColumn("Volume SMA20", format="%d"),
             "ATR_pct": st.column_config.NumberColumn("ATR %", format="%.2f%%"),
             "RSI": st.column_config.NumberColumn("RSI", format="%.2f"),
@@ -1476,7 +1503,10 @@ def main() -> None:
             *selected_symbols,
         ]
     )
-    render_refresh_controller(client, equity, positions, active_symbols)
+    refresh_symbols = get_active_symbols(
+        [*active_symbols, *st.session_state.get("market_radar_visible_symbols", [])]
+    )
+    render_refresh_controller(client, equity, positions, refresh_symbols)
 
     if active_symbols:
         personal_table = build_watchlist_table(active_symbols, positions)
