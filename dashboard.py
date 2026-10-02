@@ -1363,8 +1363,6 @@ def main() -> None:
             personal_table,
             hide_index=True,
             use_container_width=True,
-            on_select="rerun",
-            selection_mode="single-row",
             disabled=[column for column in personal_table.columns if column != "Bot"],
             key="my_ticker_table",
             column_config={
@@ -1385,16 +1383,30 @@ def main() -> None:
             edited_personal[edited_personal["Bot"] == True]["Ticker"].astype(str)
         )
         st.session_state["active_tickers"] = sorted(active_tickers)
-        selected_rows = getattr(edited_personal, "selection", None)
-        selected_rows = selected_rows.rows if selected_rows is not None else []
-        if selected_rows:
-            detail_symbol = edited_personal.iloc[selected_rows[0]]["Ticker"]
-            actions = st.columns([1, 1, 1], vertical_alignment="center")
-            actions[0].button("Compra", key=f"quick_buy_{detail_symbol}", on_click=_on_open_panel, args=(detail_symbol, "buy", {f"buy_limit_{detail_symbol}": 0.0, f"buy_stop_{detail_symbol}": 0.0, f"buy_budget_{detail_symbol}": 100.0, f"buy_confirm_{detail_symbol}": False}))
-            actions[1].button("Vendi", key=f"quick_sell_{detail_symbol}", disabled=positions.get(to_alpaca_symbol(detail_symbol)) is None, on_click=_on_open_panel, args=(detail_symbol, "sell", {f"sell_shares_{detail_symbol}": 0.0001}))
-            actions[2].button("📊 Backtest", key=f"quick_backtest_{detail_symbol}", on_click=_on_toggle_backtest, args=(detail_symbol,))
-            st.markdown(f"### Dettaglio {detail_symbol}")
-            render_symbol_card(client, equity, detail_symbol, positions)
+
+        detail_symbol = st.selectbox(
+            "Dettaglio ticker",
+            options=edited_personal["Ticker"].astype(str).tolist(),
+            index=0,
+            key="detail_symbol_selected",
+        )
+        actions = st.columns([1, 1, 1], vertical_alignment="center")
+        actions[0].button(
+            "Compra",
+            key=f"quick_buy_{detail_symbol}",
+            on_click=_on_open_panel,
+            args=(detail_symbol, "buy", {f"buy_limit_{detail_symbol}": 0.0, f"buy_stop_{detail_symbol}": 0.0, f"buy_budget_{detail_symbol}": 100.0, f"buy_confirm_{detail_symbol}": False}),
+        )
+        actions[1].button(
+            "Vendi",
+            key=f"quick_sell_{detail_symbol}",
+            disabled=positions.get(to_alpaca_symbol(detail_symbol)) is None,
+            on_click=_on_open_panel,
+            args=(detail_symbol, "sell", {f"sell_shares_{detail_symbol}": 0.0001}),
+        )
+        actions[2].button("📊 Backtest", key=f"quick_backtest_{detail_symbol}", on_click=_on_toggle_backtest, args=(detail_symbol,))
+        st.markdown(f"### Dettaglio {detail_symbol}")
+        render_symbol_card(client, equity, detail_symbol, positions)
     else:
         st.info("Seleziona i ticker dalla tabella superiore o attivali nella colonna Attiva Bot.")
 
