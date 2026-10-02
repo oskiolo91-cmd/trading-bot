@@ -1356,7 +1356,6 @@ def main() -> None:
     active_symbols = get_active_symbols(selected_symbols)
     render_refresh_controller(client, equity, positions, active_symbols)
 
-    st.subheader("I miei ticker")
     if active_symbols:
         personal_table = build_watchlist_table(active_symbols, positions)
         edited_personal = st.data_editor(
