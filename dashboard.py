@@ -1089,11 +1089,27 @@ def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd
             "ADX": data.get("adx", float("nan")),
             "RSI": data.get("rsi", float("nan")),
             "Segnale": "Sì" if compute_signal(data, get_ticker_params(symbol, state)) else "No",
-            "Bot": "Attivo" if state.get("bot_enabled", {}).get(symbol, False) else "Spento",
+            "Bot": bool(state.get("bot_enabled", {}).get(symbol, False)),
             "Posizione": "Aperta" if position is not None else "Assente",
             "P&L ($)": float(position.unrealized_pl or 0) if position is not None else float("nan"),
         })
     return pd.DataFrame(rows)
+
+
+def build_market_radar_table(radar: pd.DataFrame, active_tickers: set[str] | list[str] | None = None) -> pd.DataFrame:
+    table = radar.copy()
+    active = set(active_tickers or [])
+    table["Segnale"] = table.apply(
+        lambda row: "Scalper + Trend" if bool(row.get("Validatore_Scalper")) and bool(row.get("Validatore_Trend"))
+        else "Scalper" if bool(row.get("Validatore_Scalper"))
+        else "Trend" if bool(row.get("Validatore_Trend"))
+        else "—",
+        axis=1,
+    )
+    table["Attiva Bot"] = table["Symbol"].astype(str).isin(active)
+    table["Validatore_Scalper"] = table["Validatore_Scalper"].map({True: "🟢", False: "🔴"})
+    table["Validatore_Trend"] = table["Validatore_Trend"].map({True: "🟢", False: "🔴"})
+    return table
 
 
 def paginate_market_radar(filtered: pd.DataFrame, page: int, page_size: int) -> tuple[pd.DataFrame, int]:
@@ -1175,20 +1191,13 @@ def render_market_explorer(positions: dict, available_symbols: list[str]) -> lis
     radar_page, _ = paginate_market_radar(filtered, st.session_state[page_key], page_size)
 
     active_tickers = set(st.session_state.get("active_tickers", []))
-    radar_page["Segnale"] = radar_page.apply(
-        lambda row: "Scalper + Trend" if row["Validatore_Scalper"] and row["Validatore_Trend"]
-        else "Scalper" if row["Validatore_Scalper"] else "Trend" if row["Validatore_Trend"] else "—",
-        axis=1,
-    )
-    radar_page["Attiva Bot"] = radar_page["Symbol"].astype(str).isin(active_tickers)
-    radar_page["Validatore_Scalper"] = radar_page["Validatore_Scalper"].map({True: "🟢", False: "🔴"})
-    radar_page["Validatore_Trend"] = radar_page["Validatore_Trend"].map({True: "🟢", False: "🔴"})
-    visible_symbols = set(radar_page["Symbol"].astype(str))
+    radar_table = build_market_radar_table(radar_page, active_tickers)
+    visible_symbols = set(radar_table["Symbol"].astype(str))
     edited = st.data_editor(
-        radar_page,
+        radar_table,
         hide_index=True,
         use_container_width=True,
-        disabled=[column for column in radar_page.columns if column != "Attiva Bot"],
+        disabled=[column for column in radar_table.columns if column not in {"Attiva Bot"}],
         column_config={
             "Segnale": st.column_config.TextColumn("Segnale"),
             "Attiva Bot": st.column_config.CheckboxColumn(
@@ -1204,8 +1213,10 @@ def render_market_explorer(positions: dict, available_symbols: list[str]) -> lis
             "ADX": st.column_config.NumberColumn("ADX", format="%.2f"),
             "BB_lower": st.column_config.NumberColumn("BB Lower", format="$%.2f"),
             "SMA_200": st.column_config.NumberColumn("SMA 200", format="$%.2f"),
+            "Validatore_Scalper": st.column_config.TextColumn("Scalper"),
+            "Validatore_Trend": st.column_config.TextColumn("Trend"),
         },
-        key=f"market_radar_editor_{st.session_state[page_key]}_{radar_page['Symbol'].iloc[0]}_{radar_page['Symbol'].iloc[-1]}",
+        key=f"market_radar_editor_{st.session_state[page_key]}_{radar_table['Symbol'].iloc[0]}_{radar_table['Symbol'].iloc[-1]}",
     )
 
     updated_active = sync_market_editor_selection(
@@ -1348,24 +1359,40 @@ def main() -> None:
     st.subheader("I miei ticker")
     if active_symbols:
         personal_table = build_watchlist_table(active_symbols, positions)
-        selected_row = st.dataframe(
+        edited_personal = st.data_editor(
             personal_table,
             hide_index=True,
             use_container_width=True,
             on_select="rerun",
             selection_mode="single-row",
+            disabled=[column for column in personal_table.columns if column != "Bot"],
             key="my_ticker_table",
             column_config={
                 "Prezzo ($)": st.column_config.NumberColumn(format="$%.2f"),
                 "Var. %": st.column_config.NumberColumn(format="%.2f%%"),
                 "ADX": st.column_config.NumberColumn(format="%.2f"),
                 "RSI": st.column_config.NumberColumn(format="%.2f"),
+                "Bot": st.column_config.CheckboxColumn("Bot", help="Attiva o disattiva il bot per questo ticker."),
                 "P&L ($)": st.column_config.NumberColumn(format="$%.2f"),
             },
         )
-        selected_rows = selected_row.selection.rows
+        edited_personal = edited_personal.copy()
+        for _, row in edited_personal.iterrows():
+            symbol = str(row["Ticker"])
+            st.session_state["bot_enabled"][symbol] = bool(row["Bot"])
+        active_tickers = set(st.session_state.get("active_tickers", []))
+        active_tickers = {symbol for symbol in active_tickers if symbol in set(edited_personal["Ticker"].astype(str))} | set(
+            edited_personal[edited_personal["Bot"] == True]["Ticker"].astype(str)
+        )
+        st.session_state["active_tickers"] = sorted(active_tickers)
+        selected_rows = getattr(edited_personal, "selection", None)
+        selected_rows = selected_rows.rows if selected_rows is not None else []
         if selected_rows:
-            detail_symbol = personal_table.iloc[selected_rows[0]]["Ticker"]
+            detail_symbol = edited_personal.iloc[selected_rows[0]]["Ticker"]
+            actions = st.columns([1, 1, 1], vertical_alignment="center")
+            actions[0].button("Compra", key=f"quick_buy_{detail_symbol}", on_click=_on_open_panel, args=(detail_symbol, "buy", {f"buy_limit_{detail_symbol}": 0.0, f"buy_stop_{detail_symbol}": 0.0, f"buy_budget_{detail_symbol}": 100.0, f"buy_confirm_{detail_symbol}": False}))
+            actions[1].button("Vendi", key=f"quick_sell_{detail_symbol}", disabled=positions.get(to_alpaca_symbol(detail_symbol)) is None, on_click=_on_open_panel, args=(detail_symbol, "sell", {f"sell_shares_{detail_symbol}": 0.0001}))
+            actions[2].button("📊 Backtest", key=f"quick_backtest_{detail_symbol}", on_click=_on_toggle_backtest, args=(detail_symbol,))
             st.markdown(f"### Dettaglio {detail_symbol}")
             render_symbol_card(client, equity, detail_symbol, positions)
     else:

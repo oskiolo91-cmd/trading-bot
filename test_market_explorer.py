@@ -45,7 +45,7 @@ def test_personal_ticker_table_includes_live_metrics_signal_and_position_pnl():
 
     assert round(table.loc[0, "Var. %"], 2) == -10.0
     assert table.loc[0, "Segnale"] == "Sì"
-    assert table.loc[0, "Bot"] == "Attivo"
+    assert bool(table.loc[0, "Bot"]) is True
     assert table.loc[0, "P&L ($)"] == 2.5
 
 
@@ -89,3 +89,60 @@ def test_editor_checkbox_enables_bot_and_open_position_cannot_be_disarmed():
 
     assert active == {"A", "B"}
     assert bot_enabled == {"A": True, "B": True, "C": False}
+
+
+def test_build_watchlist_table_exposes_bot_toggle_and_useful_metrics():
+    state = {
+        "live_data": {
+            "SPY": {"price": 90.0, "prev_close": 100.0, "adx": 10.0, "rsi": 20.0, "bb_lower": 95.0},
+        },
+        "bot_enabled": {"SPY": True},
+        "profile": {},
+    }
+    positions = {"SPY": SimpleNamespace(unrealized_pl=2.5, qty=1.0, unrealized_plpc=0.03)}
+
+    table = dashboard.build_watchlist_table(["SPY"], positions, state)
+
+    assert bool(table.loc[0, "Bot"]) is True
+    assert set(table.columns) >= {"Ticker", "Prezzo ($)", "Var. %", "ADX", "RSI", "Segnale", "Bot", "Posizione", "P&L ($)"}
+    assert table.loc[0, "Segnale"] == "Sì"
+
+
+def test_build_market_radar_table_adds_signal_and_activation_flags():
+    radar = pd.DataFrame([
+        {
+            "Symbol": "A",
+            "Sector": "Tech",
+            "QuoteType": "Equity",
+            "MarketCap": 100,
+            "Close": 100.0,
+            "Volume_SMA20": 1000,
+            "ADX": 12.0,
+            "ATR_pct": 1.2,
+            "RSI": 31.0,
+            "BB_lower": 90.0,
+            "SMA_200": 95.0,
+            "Validatore_Scalper": True,
+            "Validatore_Trend": True,
+        },
+        {
+            "Symbol": "B",
+            "Sector": "Energy",
+            "QuoteType": "ETF",
+            "MarketCap": 200,
+            "Close": 200.0,
+            "Volume_SMA20": 2000,
+            "ADX": 30.0,
+            "ATR_pct": 2.0,
+            "RSI": 60.0,
+            "BB_lower": 180.0,
+            "SMA_200": 190.0,
+            "Validatore_Scalper": False,
+            "Validatore_Trend": False,
+        },
+    ])
+
+    table = dashboard.build_market_radar_table(radar, {"A"})
+
+    assert table["Attiva Bot"].tolist() == [True, False]
+    assert table["Segnale"].tolist() == ["Scalper + Trend", "—"]
