@@ -154,6 +154,21 @@ def test_editor_checkbox_enables_bot_and_open_position_cannot_be_disarmed():
     assert bot_enabled == {"A": True, "B": True, "C": False}
 
 
+def test_main_radar_bot_toggle_updates_enabled_and_active_tickers():
+    state = {"bot_enabled": {}, "active_tickers": [], "profile": {}}
+
+    dashboard.set_ticker_bot_enabled(state, "NVDA", True)
+
+    assert state["bot_enabled"]["NVDA"] is True
+    assert state["active_tickers"] == ["NVDA"]
+    assert state["profile"]["NVDA"] == dashboard.DEFAULT_PROFILE
+
+    dashboard.set_ticker_bot_enabled(state, "NVDA", False)
+
+    assert state["bot_enabled"]["NVDA"] is False
+    assert state["active_tickers"] == []
+
+
 def test_build_watchlist_table_exposes_bot_toggle_and_useful_metrics():
     state = {
         "live_data": {

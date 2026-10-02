@@ -791,15 +791,27 @@ def _on_refresh_now() -> None:
 
 def _on_toggle(symbol: str) -> None:
     enabled = bool(st.session_state.get(f"bot_{symbol}"))
-    st.session_state["bot_enabled"][symbol] = enabled
+    set_ticker_bot_enabled(st.session_state, symbol, enabled)
     st.session_state["bot_notice"][symbol] = enabled
-    active_tickers = set(st.session_state.get("active_tickers", []))
+    add_log(st.session_state, f"🤖 {symbol}: bot {'ATTIVATO' if enabled else 'disattivato'}")
+
+
+def _on_toggle_radar_bot(symbol: str) -> None:
+    enabled = not bool(st.session_state["bot_enabled"].get(symbol, False))
+    set_ticker_bot_enabled(st.session_state, symbol, enabled)
+    st.session_state[f"bot_{symbol}"] = enabled
+    add_log(st.session_state, f"🤖 {symbol}: bot {'ATTIVATO' if enabled else 'disattivato'} dal radar")
+
+
+def set_ticker_bot_enabled(state: dict, symbol: str, enabled: bool) -> None:
+    state.setdefault("bot_enabled", {})[symbol] = bool(enabled)
+    active_tickers = set(state.get("active_tickers", []))
     if enabled:
         active_tickers.add(symbol)
+        state.setdefault("profile", {}).setdefault(symbol, DEFAULT_PROFILE)
     else:
         active_tickers.discard(symbol)
-    st.session_state["active_tickers"] = sorted(active_tickers)
-    add_log(st.session_state, f"🤖 {symbol}: bot {'ATTIVATO' if enabled else 'disattivato'}")
+    state["active_tickers"] = sorted(active_tickers)
 
 
 def _on_profile_change(symbol: str) -> None:
@@ -1644,6 +1656,17 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     selected_symbol = resolve_market_radar_selected_symbol(radar_table, event.selection.rows)
     if selected_symbol:
         selected_row = radar_table.loc[radar_table["Symbol"].astype(str) == selected_symbol].iloc[0]
+        bot_enabled = bool(st.session_state["bot_enabled"].get(selected_symbol, False))
+        has_open_position = to_alpaca_symbol(selected_symbol) in positions
+        action_label = f"Disattiva bot {selected_symbol}" if bot_enabled else f"Attiva bot {selected_symbol}"
+        st.button(
+            action_label,
+            key=f"radar_bot_toggle_{selected_symbol}",
+            on_click=_on_toggle_radar_bot,
+            args=(selected_symbol,),
+            disabled=trading_client is None or (bot_enabled and has_open_position),
+            help="Un bot con una posizione aperta non può essere disattivato.",
+        )
         render_market_radar_detail(selected_row, selected_symbol)
     return selected_symbols
 
