@@ -1403,8 +1403,15 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
         radar_table,
         hide_index=True,
         use_container_width=True,
-        disabled=[column for column in radar_table.columns if column not in {"Attiva Bot"}],
+        disabled=[column for column in radar_table.columns if column not in {"Attiva Bot", "Symbol"}],
         column_config={
+            "Symbol": st.column_config.ButtonColumn(
+                "Ticker",
+                help="Clicca il ticker per aprire il dettaglio.",
+                on_click=_on_select_detail,
+                args=("market_radar_detail_table", "market_radar_table_click"),
+                key="market_radar_table_click",
+            ),
             "Segnale": st.column_config.TextColumn("Segnale"),
             "Attiva Bot": st.column_config.CheckboxColumn(
                 "Attiva Bot",
@@ -1581,6 +1588,7 @@ def main() -> None:
             *st.session_state.get("active_tickers", []),
             *position_symbols,
             *selected_symbols,
+            st.session_state.get("detail_symbol_selected"),
         ]
     )
     refresh_symbols = get_active_symbols(

@@ -56,6 +56,14 @@ def test_resolve_detail_symbol_from_click_uses_selected_row():
     assert symbol == "MSFT"
 
 
+def test_resolve_detail_symbol_from_market_radar_click_uses_symbol_column():
+    table = pd.DataFrame({"Symbol": ["AAPL", "MSFT", "NVDA"]})
+
+    symbol = dashboard.resolve_detail_symbol_from_click(table, {"row": 2})
+
+    assert symbol == "NVDA"
+
+
 def test_market_radar_pagination_returns_page_and_total_pages():
     radar = pd.DataFrame({"Symbol": ["A", "B", "C", "D", "E"]})
 
