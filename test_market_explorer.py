@@ -22,6 +22,23 @@ def test_market_radar_filters_sector_type_and_combined_validators():
     assert filtered["Symbol"].tolist() == ["A"]
 
 
+def test_market_radar_with_empty_filters_shows_everything():
+    radar = pd.DataFrame([
+        {"Symbol": "A", "Sector": "Tech", "QuoteType": "Equity", "Validatore_Scalper": True, "Validatore_Trend": True},
+        {"Symbol": "B", "Sector": "Energy", "QuoteType": "ETF", "Validatore_Scalper": False, "Validatore_Trend": False},
+    ])
+
+    filtered = dashboard.filter_market_radar(
+        radar,
+        sectors=[],
+        quote_types=[],
+        scalper_only=False,
+        trend_only=False,
+    )
+
+    assert filtered["Symbol"].tolist() == ["A", "B"]
+
+
 def test_resolve_detail_symbol_from_click_uses_selected_row():
     table = pd.DataFrame({"Ticker": ["AAPL", "MSFT", "NVDA"], "Dettaglio": ["Dettaglio"] * 3})
 

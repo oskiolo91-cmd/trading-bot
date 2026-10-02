@@ -1378,9 +1378,16 @@ def filter_market_radar(
     scalper_only: bool = False,
     trend_only: bool = False,
 ) -> pd.DataFrame:
+    sector_values = radar["Sector"].astype(str)
+    quote_type_values = radar["QuoteType"].astype(str)
+    if not sectors:
+        sectors = sorted(sector_values.unique())
+    if not quote_types:
+        quote_types = sorted(quote_type_values.unique())
+
     filtered = radar[
-        radar["Sector"].astype(str).isin(sectors)
-        & radar["QuoteType"].astype(str).isin(quote_types)
+        sector_values.isin(sectors)
+        & quote_type_values.isin(quote_types)
     ].copy()
     filtered["Validatore_Scalper"] = filtered["Validatore_Scalper"].map(_radar_bool)
     filtered["Validatore_Trend"] = filtered["Validatore_Trend"].map(_radar_bool)
