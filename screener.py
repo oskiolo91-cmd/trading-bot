@@ -7,9 +7,12 @@ import argparse
 import logging
 import math
 import os
+import random
 import tempfile
 import threading
 import time as time_module
+
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -344,7 +347,23 @@ def _merge_metadata_with_cache(cached: dict[str, Any], fresh: dict[str, Any]) ->
 
 
 def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
-    ticker = yf.Ticker(_yahoo_symbol(symbol))
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+
+    try:
+        ticker = yf.Ticker(_yahoo_symbol(symbol), session=session)
+    except TypeError:
+        ticker = yf.Ticker(_yahoo_symbol(symbol))
     info: dict[str, Any] = {}
     last_error: Exception | None = None
 
@@ -356,6 +375,11 @@ def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
                 break
         except Exception as exc:
             last_error = exc
+            message = str(exc).lower()
+            if "too many requests" in message or "429" in message:
+                LOG.warning("Rate limit raggiunto, pausa di 60 secondi... (%s)", symbol)
+                time_module.sleep(60)
+                continue
             LOG.warning("Metadata fetch failed for %s (attempt %s/3): %s", symbol, attempt + 1, exc)
 
         try:
@@ -388,6 +412,8 @@ def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
         if fast_info is not None:
             market_cap = getattr(fast_info, "market_cap", None)
     sector = info.get("sector") or info.get("industry") or "Unknown"
+
+    time_module.sleep(random.uniform(1.5, 3.0))
 
     return {
         "Sector": str(sector),

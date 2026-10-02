@@ -89,7 +89,7 @@ def test_fetch_yahoo_metadata_retries_after_transient_yahoo_error(monkeypatch):
                 "marketCap": 123_000_000,
             }
 
-    monkeypatch.setattr(screener.yf, "Ticker", lambda symbol: FakeTicker())
+    monkeypatch.setattr(screener.yf, "Ticker", lambda *args, **kwargs: FakeTicker())
     monkeypatch.setattr(screener.time_module, "sleep", lambda *_args, **_kwargs: None)
 
     metadata = screener._fetch_yahoo_metadata("AAPL")
@@ -107,7 +107,7 @@ def test_fetch_yahoo_metadata_uses_fast_info_fallback_when_get_info_fails(monkey
         def get_info(self):
             raise RuntimeError("Yahoo blocked request")
 
-    monkeypatch.setattr(screener.yf, "Ticker", lambda symbol: FakeTicker())
+    monkeypatch.setattr(screener.yf, "Ticker", lambda *args, **kwargs: FakeTicker())
     monkeypatch.setattr(screener.time_module, "sleep", lambda *_args, **_kwargs: None)
 
     metadata = screener._fetch_yahoo_metadata("AAPL")
