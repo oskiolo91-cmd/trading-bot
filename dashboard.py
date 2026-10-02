@@ -6,6 +6,7 @@ import math
 import hashlib
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -1259,22 +1260,32 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
         elif not available_symbols:
             st.info("Connessione Alpaca attiva, ma non risultano asset USA attivi, tradabili e frazionabili.")
         else:
-            st.info(f"Ricerca non ancora generata. Genera i dati per {len(available_symbols)} asset Alpaca.")
-            if st.button("Genera tabella di ricerca", key="generate_market_radar"):
+            generation_started = st.session_state.get("market_radar_generation_started", False)
+            if not generation_started:
                 key, secret, _ = _live_credentials()
-                try:
-                    from screener import generate_market_radar
 
-                    with st.spinner("Caricamento ticker e indicatori di mercato…"):
+                def _background_generate_market_radar():
+                    try:
+                        from screener import generate_market_radar
+
                         generate_market_radar(
                             symbols=available_symbols,
                             output_path=radar_path,
                             trading_client=trading_client,
                             data_client=StockHistoricalDataClient(key, secret),
+                            batch_size=25,
                         )
-                    st.rerun(scope="app")
-                except Exception as exc:
-                    st.error(f"Impossibile generare la tabella di ricerca: {exc}")
+                    finally:
+                        st.session_state["market_radar_generation_started"] = False
+
+                st.session_state["market_radar_generation_started"] = True
+                threading.Thread(target=_background_generate_market_radar, daemon=True).start()
+
+            st.info("Generazione radar in corso: i ticker compaiono man mano mentre il file locale viene aggiornato.")
+            if st.button("Aggiorna vista", key="refresh_market_radar_generation"):
+                st.rerun(scope="app")
+            if st.session_state.get("market_radar_generation_started") is False and radar_path.exists():
+                st.rerun(scope="app")
         return selected_symbols
     try:
         radar = pd.read_csv(radar_path)

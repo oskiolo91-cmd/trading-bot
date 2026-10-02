@@ -260,6 +260,8 @@ def generate_market_radar(
     metadata_workers: int = 8,
     trading_client=None,
     data_client=None,
+    progress_callback=None,
+    batch_size: int = 50,
 ) -> pd.DataFrame:
     """Build market_radar.csv using batched Alpaca daily bars and Yahoo metadata."""
     output_path = resolve_market_radar_path(output_path)
@@ -300,9 +302,9 @@ def generate_market_radar(
         LOG.warning("Could not read Alpaca market clock; today's bar will be excluded")
         market_is_open = True
 
-    rows = []
-    for offset in range(0, len(symbols), 50):
-        batch = symbols[offset:offset + 50]
+    rows: list[dict[str, Any]] = []
+    for offset in range(0, len(symbols), batch_size):
+        batch = symbols[offset:offset + batch_size]
         alpaca_symbols = [symbol.replace("-", ".") for symbol in batch]
         frames = fetch_daily_bars(alpaca_symbols, start=start, end=end, client=data_client)
         for symbol, alpaca_symbol in zip(batch, alpaca_symbols):
@@ -311,6 +313,13 @@ def generate_market_radar(
                 rows.append(_radar_row(symbol, frame, metadata_by_symbol[symbol]))
             except Exception as exc:
                 LOG.warning("Skipping %s from market radar: %s", symbol, exc)
+
+        partial = pd.DataFrame(rows, columns=RADAR_COLUMNS)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        partial.to_csv(output_path, index=False)
+        if progress_callback is not None:
+            progress_callback(partial)
 
     radar = pd.DataFrame(rows, columns=RADAR_COLUMNS)
     output_path = Path(output_path)
