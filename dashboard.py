@@ -1094,27 +1094,60 @@ def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd
     rows = []
     for symbol in symbols:
         data = state.get("live_data", {}).get(symbol, {})
+        position = positions.get(to_alpaca_symbol(symbol))
         price = data.get("price")
-        previous_close = data.get("prev_close")
+        if price is None and position is not None:
+            price = getattr(position, "current_price", None)
+        price = _number_or_nan(price)
+        previous_close = _number_or_nan(data.get("prev_close"))
         change = (
             (price / previous_close - 1) * 100
-            if isinstance(price, (int, float)) and isinstance(previous_close, (int, float))
-            and math.isfinite(price) and math.isfinite(previous_close) and previous_close != 0
+            if math.isfinite(price) and math.isfinite(previous_close) and previous_close != 0
             else float("nan")
         )
-        position = positions.get(to_alpaca_symbol(symbol))
+        quantity = _number_or_nan(getattr(position, "qty", None)) if position is not None else float("nan")
+        entry_price = _number_or_nan(getattr(position, "avg_entry_price", None)) if position is not None else float("nan")
+        invested = _number_or_nan(getattr(position, "cost_basis", None)) if position is not None else float("nan")
+        if not math.isfinite(invested) and math.isfinite(entry_price) and math.isfinite(quantity):
+            invested = abs(entry_price * quantity)
+        current_value = _number_or_nan(getattr(position, "market_value", None)) if position is not None else float("nan")
+        if not math.isfinite(current_value) and math.isfinite(price) and math.isfinite(quantity):
+            current_value = price * quantity
+        pnl = _number_or_nan(getattr(position, "unrealized_pl", None)) if position is not None else float("nan")
+        if not math.isfinite(pnl) and math.isfinite(current_value) and math.isfinite(invested):
+            pnl = current_value - invested
+        pnl_pct = _number_or_nan(getattr(position, "unrealized_plpc", None)) if position is not None else float("nan")
+        if math.isfinite(pnl_pct):
+            pnl_pct *= 100
+        elif math.isfinite(pnl) and math.isfinite(invested) and invested != 0:
+            pnl_pct = pnl / invested * 100
+        else:
+            pnl_pct = float("nan")
         rows.append({
             "Ticker": symbol,
-            "Prezzo ($)": price if isinstance(price, (int, float)) else float("nan"),
-            "Var. %": change,
+            "Prezzo attuale ($)": price,
+            "Var. giornaliera %": change,
+            "Prezzo medio acquisto ($)": entry_price,
+            "Quantità": quantity,
+            "Capitale investito ($)": invested,
+            "Valore attuale ($)": current_value,
             "ADX": data.get("adx", float("nan")),
             "RSI": data.get("rsi", float("nan")),
             "Segnale": "Sì" if compute_signal(data, get_ticker_params(symbol, state)) else "No",
             "Bot": bool(state.get("bot_enabled", {}).get(symbol, False)),
             "Posizione": "Aperta" if position is not None else "Assente",
-            "P&L ($)": float(position.unrealized_pl or 0) if position is not None else float("nan"),
+            "P&L ($)": pnl,
+            "P&L posizione %": pnl_pct,
         })
     return pd.DataFrame(rows)
+
+
+def _number_or_nan(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number if math.isfinite(number) else float("nan")
 
 
 def build_market_radar_table(radar: pd.DataFrame, active_tickers: set[str] | list[str] | None = None) -> pd.DataFrame:
@@ -1402,12 +1435,17 @@ def main() -> None:
                     args=("detail_source_table", "my_ticker_table_click"),
                     key="my_ticker_table_click",
                 ),
-                "Prezzo ($)": st.column_config.NumberColumn(format="$%.2f"),
-                "Var. %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Prezzo attuale ($)": st.column_config.NumberColumn(format="$%.2f"),
+                "Var. giornaliera %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Prezzo medio acquisto ($)": st.column_config.NumberColumn(format="$%.2f"),
+                "Quantità": st.column_config.NumberColumn(format="%.4f"),
+                "Capitale investito ($)": st.column_config.NumberColumn(format="$%.2f"),
+                "Valore attuale ($)": st.column_config.NumberColumn(format="$%.2f"),
                 "ADX": st.column_config.NumberColumn(format="%.2f"),
                 "RSI": st.column_config.NumberColumn(format="%.2f"),
                 "Bot": st.column_config.CheckboxColumn("Bot", help="Attiva o disattiva il bot per questo ticker."),
                 "P&L ($)": st.column_config.NumberColumn(format="$%.2f"),
+                "P&L posizione %": st.column_config.NumberColumn(format="%.2f%%"),
             },
         )
         edited_personal = edited_personal.copy()

@@ -51,7 +51,7 @@ def test_personal_ticker_table_includes_live_metrics_signal_and_position_pnl():
 
     table = dashboard.build_watchlist_table(["SPY"], positions, state)
 
-    assert round(table.loc[0, "Var. %"], 2) == -10.0
+    assert round(table.loc[0, "Var. giornaliera %"], 2) == -10.0
     assert table.loc[0, "Segnale"] == "Sì"
     assert bool(table.loc[0, "Bot"]) is True
     assert table.loc[0, "P&L ($)"] == 2.5
@@ -102,18 +102,36 @@ def test_editor_checkbox_enables_bot_and_open_position_cannot_be_disarmed():
 def test_build_watchlist_table_exposes_bot_toggle_and_useful_metrics():
     state = {
         "live_data": {
-            "SPY": {"price": 90.0, "prev_close": 100.0, "adx": 10.0, "rsi": 20.0, "bb_lower": 95.0},
+            "SPY": {"price": 120.0, "prev_close": 100.0, "adx": 10.0, "rsi": 20.0, "bb_lower": 125.0},
         },
         "bot_enabled": {"SPY": True},
         "profile": {},
     }
-    positions = {"SPY": SimpleNamespace(unrealized_pl=2.5, qty=1.0, unrealized_plpc=0.03)}
+    positions = {"SPY": SimpleNamespace(
+        unrealized_pl="60.00",
+        qty="3",
+        unrealized_plpc="0.20",
+        avg_entry_price="100.00",
+        cost_basis="300.00",
+        market_value="360.00",
+    )}
 
     table = dashboard.build_watchlist_table(["SPY"], positions, state)
 
     assert bool(table.loc[0, "Bot"]) is True
-    assert set(table.columns) >= {"Ticker", "Prezzo ($)", "Var. %", "ADX", "RSI", "Segnale", "Bot", "Posizione", "P&L ($)"}
+    assert set(table.columns) >= {
+        "Ticker", "Prezzo attuale ($)", "Var. giornaliera %", "Prezzo medio acquisto ($)",
+        "Quantità", "Capitale investito ($)", "Valore attuale ($)", "ADX", "RSI", "Segnale",
+        "Bot", "Posizione", "P&L ($)", "P&L posizione %",
+    }
     assert table.loc[0, "Segnale"] == "Sì"
+    assert table.loc[0, "Prezzo attuale ($)"] == 120.0
+    assert table.loc[0, "Prezzo medio acquisto ($)"] == 100.0
+    assert table.loc[0, "Quantità"] == 3.0
+    assert table.loc[0, "Capitale investito ($)"] == 300.0
+    assert table.loc[0, "Valore attuale ($)"] == 360.0
+    assert table.loc[0, "P&L ($)"] == 60.0
+    assert table.loc[0, "P&L posizione %"] == 20.0
 
 
 def test_build_market_radar_table_adds_signal_and_activation_flags():
