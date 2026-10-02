@@ -22,6 +22,15 @@ def test_market_radar_filters_sector_type_and_combined_validators():
     assert filtered["Symbol"].tolist() == ["A"]
 
 
+def test_resolve_market_radar_path_prefers_existing_local_csv(tmp_path):
+    existing = tmp_path / "market_radar.csv"
+    existing.write_text("Symbol,Sector\nAAPL,Technology\n")
+
+    resolved = dashboard.resolve_market_radar_path(tmp_path / "missing.csv")
+
+    assert resolved == existing
+
+
 def test_market_radar_with_empty_filters_shows_everything():
     radar = pd.DataFrame([
         {"Symbol": "A", "Sector": "Tech", "QuoteType": "Equity", "Validatore_Scalper": True, "Validatore_Trend": True},

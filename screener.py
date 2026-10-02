@@ -29,6 +29,22 @@ RADAR_COLUMNS = [
 ]
 
 
+def resolve_market_radar_path(output_path: str | Path | None = None) -> Path:
+    candidates: list[Path] = []
+    if output_path is not None:
+        requested = Path(output_path)
+        candidates.append(requested)
+        candidates.append(requested.parent / "market_radar.csv")
+    candidates.extend([
+        Path.cwd() / "market_radar.csv",
+        MARKET_RADAR_PATH,
+    ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path(output_path) if output_path is not None else MARKET_RADAR_PATH
+
+
 def evaluate_asset(csv_path, min_avg_volume=1_000_000, lookback=20, adx_max=25.0, min_lateral_ratio=0.5, min_atr_pct=0.005):
     data = prepare_data(load_ohlcv_csv(csv_path))
     recent = data.tail(lookback)
@@ -240,12 +256,13 @@ def _radar_row(symbol: str, bars: pd.DataFrame, metadata: dict[str, Any]) -> dic
 
 def generate_market_radar(
     symbols: list[str] | None = None,
-    output_path: str | Path = MARKET_RADAR_PATH,
+    output_path: str | Path | None = None,
     metadata_workers: int = 8,
     trading_client=None,
     data_client=None,
 ) -> pd.DataFrame:
     """Build market_radar.csv using batched Alpaca daily bars and Yahoo metadata."""
+    output_path = resolve_market_radar_path(output_path)
     symbols = list(dict.fromkeys(symbols or load_index_universe()))
     if not symbols:
         raise ValueError("At least one ticker is required")

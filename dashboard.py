@@ -27,6 +27,22 @@ BOT_DIR = Path(__file__).resolve().parent
 if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
+
+def resolve_market_radar_path(output_path: str | Path | None = None) -> Path:
+    candidates: list[Path] = []
+    if output_path is not None:
+        requested = Path(output_path)
+        candidates.append(requested)
+        candidates.append(requested.parent / "market_radar.csv")
+    candidates.extend([
+        Path.cwd() / "market_radar.csv",
+        BOT_DIR / "market_radar.csv",
+    ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path(output_path) if output_path is not None else BOT_DIR / "market_radar.csv"
+
 from backtest import BacktestResult, download_daily_bars, prepare_data, run_backtest
 from alpaca_data import fetch_daily_bars
 from models import StrategyParams
@@ -1236,7 +1252,7 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     search_col, sector_col, type_col = st.columns([1.6, 1.4, 1.2])
     selected_symbols = []
     search_query = search_col.text_input("Cerca nel radar", key="radar_search")
-    radar_path = BOT_DIR / "market_radar.csv"
+    radar_path = resolve_market_radar_path(BOT_DIR / "market_radar.csv")
     if not radar_path.exists():
         if trading_client is None:
             st.info("Connessione Alpaca non disponibile. Configura ALPACA_API_KEY e ALPACA_SECRET_KEY nei Secrets dell'app.")
