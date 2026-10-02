@@ -22,6 +22,14 @@ def test_market_radar_filters_sector_type_and_combined_validators():
     assert filtered["Symbol"].tolist() == ["A"]
 
 
+def test_resolve_detail_symbol_from_click_uses_selected_row():
+    table = pd.DataFrame({"Ticker": ["AAPL", "MSFT", "NVDA"], "Dettaglio": ["Dettaglio"] * 3})
+
+    symbol = dashboard.resolve_detail_symbol_from_click(table, {"row": 1})
+
+    assert symbol == "MSFT"
+
+
 def test_market_radar_pagination_returns_page_and_total_pages():
     radar = pd.DataFrame({"Symbol": ["A", "B", "C", "D", "E"]})
 

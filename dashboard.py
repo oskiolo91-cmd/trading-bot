@@ -764,6 +764,27 @@ def _on_open_panel(symbol: str, kind: str, defaults: dict) -> None:
         st.session_state[key] = value
 
 
+def resolve_detail_symbol_from_click(table: pd.DataFrame | None, click_state: dict | None) -> str | None:
+    if table is None or click_state is None:
+        return None
+    try:
+        row_index = int(click_state.get("row", 0))
+    except (TypeError, ValueError):
+        return None
+    if row_index < 0 or row_index >= len(table):
+        return None
+    ticker = table.iloc[row_index].get("Ticker", table.iloc[row_index].get("Symbol"))
+    return str(ticker) if ticker is not None else None
+
+
+def _on_select_detail(table_key: str, click_key: str) -> None:
+    click = st.session_state.get(click_key)
+    target = st.session_state.get(table_key)
+    symbol = resolve_detail_symbol_from_click(target, click)
+    if symbol:
+        st.session_state["detail_symbol_selected"] = symbol
+
+
 def _on_submit_buy(client, symbol: str) -> None:
     limit = float(st.session_state[f"buy_limit_{symbol}"])
     stop = float(st.session_state[f"buy_stop_{symbol}"])
@@ -1187,6 +1208,7 @@ def render_market_explorer(positions: dict, available_symbols: list[str]) -> lis
 
     active_tickers = set(st.session_state.get("active_tickers", []))
     radar_table = build_market_radar_table(radar_page, active_tickers)
+    st.session_state["market_radar_detail_table"] = radar_table
     visible_symbols = set(radar_table["Symbol"].astype(str))
     edited = st.data_editor(
         radar_table,
@@ -1365,13 +1387,21 @@ def main() -> None:
 
     if active_symbols:
         personal_table = build_watchlist_table(active_symbols, positions)
+        st.session_state["detail_source_table"] = personal_table
         edited_personal = st.data_editor(
             personal_table,
             hide_index=True,
             use_container_width=True,
-            disabled=[column for column in personal_table.columns if column != "Bot"],
+            disabled=[column for column in personal_table.columns if column not in {"Bot", "Ticker"}],
             key="my_ticker_table",
             column_config={
+                "Ticker": st.column_config.ButtonColumn(
+                    "Ticker",
+                    help="Clicca il ticker per aprire il dettaglio.",
+                    on_click=_on_select_detail,
+                    args=("detail_source_table", "my_ticker_table_click"),
+                    key="my_ticker_table_click",
+                ),
                 "Prezzo ($)": st.column_config.NumberColumn(format="$%.2f"),
                 "Var. %": st.column_config.NumberColumn(format="%.2f%%"),
                 "ADX": st.column_config.NumberColumn(format="%.2f"),
@@ -1390,12 +1420,11 @@ def main() -> None:
         )
         st.session_state["active_tickers"] = sorted(active_tickers)
 
-        detail_symbol = st.selectbox(
-            "Dettaglio ticker",
-            options=edited_personal["Ticker"].astype(str).tolist(),
-            index=0,
-            key="detail_symbol_selected",
-        )
+        detail_options = edited_personal["Ticker"].astype(str).tolist()
+        detail_symbol = st.session_state.get("detail_symbol_selected")
+        if detail_symbol not in detail_options:
+            detail_symbol = detail_options[0]
+            st.session_state["detail_symbol_selected"] = detail_symbol
         actions = st.columns([1, 1, 1], vertical_alignment="center")
         actions[0].button(
             "Compra",
