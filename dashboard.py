@@ -1348,10 +1348,16 @@ def main() -> None:
     controls[0].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
     controls[1].toggle("Auto-refresh", key="auto_refresh")
     selected_symbols = render_market_explorer(positions, available_symbols)
+
+    position_symbols = [
+        symbol for symbol, position in positions.items()
+        if position is not None and getattr(position, "qty", 0) not in (None, 0)
+    ]
     active_symbols = get_active_symbols(
         [
             *[symbol for symbol, enabled in st.session_state["bot_enabled"].items() if enabled],
             *st.session_state.get("active_tickers", []),
+            *position_symbols,
             *selected_symbols,
         ]
     )
