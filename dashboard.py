@@ -796,13 +796,6 @@ def _on_toggle(symbol: str) -> None:
     add_log(st.session_state, f"🤖 {symbol}: bot {'ATTIVATO' if enabled else 'disattivato'}")
 
 
-def _on_toggle_radar_bot(symbol: str) -> None:
-    enabled = not bool(st.session_state["bot_enabled"].get(symbol, False))
-    set_ticker_bot_enabled(st.session_state, symbol, enabled)
-    st.session_state[f"bot_{symbol}"] = enabled
-    add_log(st.session_state, f"🤖 {symbol}: bot {'ATTIVATO' if enabled else 'disattivato'} dal radar")
-
-
 def set_ticker_bot_enabled(state: dict, symbol: str, enabled: bool) -> None:
     state.setdefault("bot_enabled", {})[symbol] = bool(enabled)
     active_tickers = set(state.get("active_tickers", []))
@@ -1618,26 +1611,38 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     radar_page, _ = paginate_market_radar(filtered, st.session_state[page_key], page_size)
     st.session_state["market_radar_visible_symbols"] = radar_page["Symbol"].astype(str).tolist()
 
-    active_tickers = set(st.session_state.get("active_tickers", []))
+    active_tickers = {
+        symbol for symbol, enabled in st.session_state["bot_enabled"].items() if enabled
+    }
     radar_table = build_market_radar_table(
         radar_page,
         active_tickers,
         st.session_state.get("live_data", {}),
     )
-    radar_table = radar_table.rename(columns={"Attiva Bot": "Bot attivo"})
     selection_key = hashlib.sha256(
         "\0".join(radar_table["Symbol"].astype(str)).encode()
     ).hexdigest()[:12]
-    event = st.dataframe(
+    st.session_state["market_radar_detail_table"] = radar_table
+    visible_symbols = set(radar_table["Symbol"].astype(str))
+    edited = st.data_editor(
         radar_table,
         hide_index=True,
         width="stretch",
-        on_select="rerun",
-        selection_mode="single-row",
+        disabled=[column for column in radar_table.columns if column not in {"Symbol", "Attiva Bot"}],
         column_config={
-            "Symbol": st.column_config.TextColumn("Ticker"),
+            "Symbol": st.column_config.ButtonColumn(
+                "Ticker",
+                help="Clicca il ticker per aprire il dettaglio.",
+                on_click=_on_select_detail,
+                args=("market_radar_detail_table", "market_radar_table_click"),
+                key="market_radar_table_click",
+            ),
             "Segnale": st.column_config.TextColumn("Segnale"),
-            "Bot attivo": st.column_config.CheckboxColumn("Bot attivo"),
+            "Attiva Bot": st.column_config.CheckboxColumn(
+                "Bot attivo",
+                help="Clicca la casella per attivare o disattivare il bot.",
+                disabled=trading_client is None,
+            ),
             "MarketCap": st.column_config.NumberColumn("Market Cap", format="$%d"),
             "Close": st.column_config.NumberColumn("Close", format="$%.2f"),
             "Prezzo dinamico ($)": st.column_config.NumberColumn("Prezzo attuale", format="$%.2f"),
@@ -1651,23 +1656,22 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
             "Validatore_Scalper": st.column_config.TextColumn("Scalper"),
             "Validatore_Trend": st.column_config.TextColumn("Trend"),
         },
-        key=f"market_radar_dataframe_{selection_key}",
+        key=f"market_radar_editor_{selection_key}",
     )
-    selected_symbol = resolve_market_radar_selected_symbol(radar_table, event.selection.rows)
+    updated_active = sync_market_editor_selection(
+        set(st.session_state.get("active_tickers", [])),
+        visible_symbols,
+        edited,
+        positions,
+        st.session_state["bot_enabled"],
+    )
+    if updated_active != set(st.session_state.get("active_tickers", [])):
+        st.session_state["active_tickers"] = sorted(updated_active)
+    selected_symbol = st.session_state.get("detail_symbol_selected")
     if selected_symbol:
-        selected_row = radar_table.loc[radar_table["Symbol"].astype(str) == selected_symbol].iloc[0]
-        bot_enabled = bool(st.session_state["bot_enabled"].get(selected_symbol, False))
-        has_open_position = to_alpaca_symbol(selected_symbol) in positions
-        action_label = f"Disattiva bot {selected_symbol}" if bot_enabled else f"Attiva bot {selected_symbol}"
-        st.button(
-            action_label,
-            key=f"radar_bot_toggle_{selected_symbol}",
-            on_click=_on_toggle_radar_bot,
-            args=(selected_symbol,),
-            disabled=trading_client is None or (bot_enabled and has_open_position),
-            help="Un bot con una posizione aperta non può essere disattivato.",
-        )
-        render_market_radar_detail(selected_row, selected_symbol)
+        selected_rows = radar_table[radar_table["Symbol"].astype(str) == str(selected_symbol)]
+        if not selected_rows.empty:
+            render_market_radar_detail(selected_rows.iloc[0], str(selected_symbol))
     return selected_symbols
 
 
