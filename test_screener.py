@@ -6,6 +6,13 @@ import pandas as pd
 import screener
 
 
+def _seed_nasdaq_db(radar_path, rows):
+    database_path = radar_path.parent / "nasdaq_screener.csv"
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(database_path, index=False)
+    return database_path
+
+
 def test_radar_row_calculates_validators_from_last_closed_bar(monkeypatch):
     dates = pd.date_range("2026-01-01", periods=200, freq="B", tz="UTC")
     close = np.full(200, 10.0)
@@ -33,7 +40,36 @@ def test_radar_row_calculates_validators_from_last_closed_bar(monkeypatch):
     assert row["Validatore_Trend"] is True
 
 
-def test_radar_exports_schema_and_metadata(tmp_path, monkeypatch):
+def test_update_nasdaq_db_downloads_and_normalizes_reference_data(tmp_path, monkeypatch):
+    request = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": {"rows": [{
+                "symbol": "brk.b", "name": "Berkshire Hathaway", "sector": "Financial Services",
+                "industry": "Insurance", "marketCap": "$1,234,000",
+            }]}}
+
+    def fake_get(url, **kwargs):
+        request.update(url=url, **kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(screener.requests, "get", fake_get)
+    output = tmp_path / "nasdaq_screener.csv"
+    database = screener.update_nasdaq_db(output)
+    stored = pd.read_csv(output)
+
+    assert request["url"] == screener.NASDAQ_SCREENER_URL
+    assert request["headers"] == screener.NASDAQ_HEADERS
+    assert database.loc[0, "symbol"] == "BRK-B"
+    assert database.loc[0, "marketCap"] == 1_234_000
+    assert stored.loc[0, "name"] == "Berkshire Hathaway"
+
+
+def test_radar_exports_schema_and_nasdaq_metadata(tmp_path, monkeypatch):
     dates = pd.date_range("2025-01-01", periods=220, freq="B", tz="UTC")
     close = pd.Series(np.linspace(100, 120, len(dates)), index=dates)
     frame = pd.DataFrame({
@@ -45,9 +81,24 @@ def test_radar_exports_schema_and_metadata(tmp_path, monkeypatch):
         "Volume": 100_000,
     }, index=dates)
 
-    monkeypatch.setattr(screener, "_fetch_yahoo_metadata", lambda symbol: {
-        "Sector": "Technology", "QuoteType": "Equity", "MarketCap": 123_000_000,
-    })
+    output = tmp_path / "market_radar.csv"
+    nasdaq_requests = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": {"rows": [{
+                "symbol": "SPY", "name": "SPDR S&P 500 ETF", "sector": "ETF",
+                "industry": "Large Blend", "marketCap": "123000000",
+            }]}}
+
+    def fake_get(*args, **kwargs):
+        nasdaq_requests.append((args, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(screener.requests, "get", fake_get)
     data_client = object()
     received_clients = []
 
@@ -61,7 +112,6 @@ def test_radar_exports_schema_and_metadata(tmp_path, monkeypatch):
         def get_clock(self):
             return type("Clock", (), {"is_open": False})()
 
-    output = tmp_path / "market_radar.csv"
     radar = screener.generate_market_radar(
         ["SPY"], output, trading_client=FakeTradingClient(), data_client=data_client
     )
@@ -69,52 +119,60 @@ def test_radar_exports_schema_and_metadata(tmp_path, monkeypatch):
 
     assert output.exists()
     assert list(radar.columns) == screener.RADAR_COLUMNS
-    assert stored.loc[0, "Sector"] == "Technology"
-    assert stored.loc[0, "QuoteType"] == "Equity"
+    assert stored.loc[0, "Sector"] == "ETF"
+    assert stored.loc[0, "Industry"] == "Large Blend"
+    assert stored.loc[0, "SecurityName"] == "SPDR S&P 500 ETF"
+    assert stored.loc[0, "MarketCap"] == 123_000_000
     assert stored.loc[0, "Symbol"] == "SPY"
     assert received_clients == [data_client]
+    assert len(nasdaq_requests) == 1
 
 
-def test_fetch_yahoo_metadata_retries_after_transient_yahoo_error(monkeypatch):
-    attempts = {"count": 0}
+def test_nasdaq_metadata_lookup_uses_index_and_unknown_fallback():
+    database = pd.DataFrame([{
+        "name": "Apple Inc.", "sector": "Technology", "industry": "Consumer Electronics",
+        "marketCap": 456_000_000,
+    }], index=pd.Index(["AAPL"], name="symbol"))
 
-    class FakeTicker:
-        def get_info(self):
-            attempts["count"] += 1
-            if attempts["count"] == 1:
-                raise RuntimeError("temporary Yahoo issue")
-            return {
-                "sector": "Technology",
-                "quoteType": "EQUITY",
-                "marketCap": 123_000_000,
-            }
+    found = screener._nasdaq_metadata(database, "AAPL")
+    missing = screener._nasdaq_metadata(database, "MSFT")
 
-    monkeypatch.setattr(screener.yf, "Ticker", lambda *args, **kwargs: FakeTicker())
-    monkeypatch.setattr(screener.time_module, "sleep", lambda *_args, **_kwargs: None)
-
-    metadata = screener._fetch_yahoo_metadata("AAPL")
-
-    assert metadata["Sector"] == "Technology"
-    assert metadata["QuoteType"] == "Equity"
-    assert metadata["MarketCap"] == 123_000_000
-    assert attempts["count"] == 2
+    assert found == {
+        "SecurityName": "Apple Inc.", "Sector": "Technology",
+        "Industry": "Consumer Electronics", "MarketCap": 456_000_000,
+    }
+    assert missing == {
+        "SecurityName": "Unknown", "Sector": "Unknown", "Industry": "Unknown", "MarketCap": None,
+    }
 
 
-def test_fetch_yahoo_metadata_uses_fast_info_fallback_when_get_info_fails(monkeypatch):
-    class FakeTicker:
-        fast_info = type("FastInfo", (), {"market_cap": 456_000_000})()
+def test_sync_market_radar_metadata_preserves_financial_fields(tmp_path):
+    output = tmp_path / "market_radar.csv"
+    row = screener._empty_radar_row("AAPL")
+    row.update({
+        "SecurityName": "Old name", "Sector": "Old sector", "Industry": "Old industry",
+        "MarketCap": 100, "Close": 190.0, "Volume_SMA20": 5000,
+        "ADX": 20.0, "ATR_pct": 1.5, "RSI": 35.0, "BB_lower": 180.0,
+        "SMA_200": 170.0, "Validatore_Scalper": True, "Validatore_Trend": False,
+    })
+    screener._write_market_radar(pd.DataFrame([row]), output)
+    _seed_nasdaq_db(output, [{
+        "symbol": "AAPL", "name": "Apple Inc.", "sector": "Technology",
+        "industry": "Consumer Electronics", "marketCap": 3_000_000,
+    }])
 
-        def get_info(self):
-            raise RuntimeError("Yahoo blocked request")
+    screener.sync_market_radar_metadata(output)
+    stored = pd.read_csv(output).iloc[0]
 
-    monkeypatch.setattr(screener.yf, "Ticker", lambda *args, **kwargs: FakeTicker())
-    monkeypatch.setattr(screener.time_module, "sleep", lambda *_args, **_kwargs: None)
-
-    metadata = screener._fetch_yahoo_metadata("AAPL")
-
-    assert metadata["Sector"] == "Unknown"
-    assert metadata["QuoteType"] == "Equity"
-    assert metadata["MarketCap"] == 456_000_000
+    assert stored["SecurityName"] == "Apple Inc."
+    assert stored["Sector"] == "Technology"
+    assert stored["Industry"] == "Consumer Electronics"
+    assert stored["MarketCap"] == 3_000_000
+    assert stored["Close"] == 190.0
+    assert stored["Volume_SMA20"] == 5000
+    assert stored["RSI"] == 35.0
+    assert bool(stored["Validatore_Scalper"]) is True
+    assert bool(stored["Validatore_Trend"]) is False
 
 
 def test_generate_market_radar_keeps_cached_sector_metadata_on_refresh(tmp_path, monkeypatch):
@@ -148,11 +206,10 @@ def test_generate_market_radar_keeps_cached_sector_metadata_on_refresh(tmp_path,
         }
     ]).to_csv(output, index=False)
 
-    monkeypatch.setattr(screener, "_fetch_yahoo_metadata", lambda symbol: {
-        "Sector": "Unknown",
-        "QuoteType": "Equity",
-        "MarketCap": None,
-    })
+    _seed_nasdaq_db(output, [{
+        "symbol": "MSFT", "name": "Microsoft Corporation", "sector": "Technology",
+        "industry": "Software", "marketCap": 200_000_000,
+    }])
     monkeypatch.setattr(screener, "fetch_daily_bars", lambda symbols, **kwargs: {symbol: frame for symbol in symbols})
 
     class FakeTradingClient:
@@ -164,6 +221,9 @@ def test_generate_market_radar_keeps_cached_sector_metadata_on_refresh(tmp_path,
 
     assert stored.loc[0, "Sector"] == "Technology"
     assert stored.loc[0, "QuoteType"] == "Equity"
+    assert stored.loc[0, "Close"] == 120.0
+    assert stored.loc[0, "MarketCap"] == 123_000_000
+    assert stored.loc[0, "SecurityName"] == "Unknown"
 
 
 def test_generate_market_radar_creates_missing_output_directory(tmp_path, monkeypatch):
@@ -180,11 +240,10 @@ def test_generate_market_radar_creates_missing_output_directory(tmp_path, monkey
 
     output = tmp_path / "subdir" / "market_radar.csv"
 
-    monkeypatch.setattr(screener, "_fetch_yahoo_metadata", lambda symbol: {
-        "Sector": "Technology",
-        "QuoteType": "Equity",
-        "MarketCap": 123_000_000,
-    })
+    monkeypatch.setattr(
+        screener, "_load_nasdaq_db",
+        lambda *_args: pd.DataFrame(columns=["name", "sector", "industry", "marketCap"], index=pd.Index([], name="symbol")),
+    )
     monkeypatch.setattr(screener, "fetch_daily_bars", lambda symbols, **kwargs: {symbol: frame for symbol in symbols})
 
     class FakeTradingClient:
@@ -195,7 +254,7 @@ def test_generate_market_radar_creates_missing_output_directory(tmp_path, monkey
 
     assert output.exists()
     stored = pd.read_csv(output)
-    assert stored.loc[0, "Sector"] == "Technology"
+    assert stored.loc[0, "Sector"] == "Unknown"
 
 
 def test_initialize_market_radar_bootstraps_and_preserves_existing_data(tmp_path):
@@ -237,11 +296,10 @@ def test_generate_market_radar_writes_progressively_to_csv(monkeypatch, tmp_path
     output = tmp_path / "progressive_market_radar.csv"
     calls = []
 
-    monkeypatch.setattr(screener, "_fetch_yahoo_metadata", lambda symbol: {
-        "Sector": "Technology",
-        "QuoteType": "Equity",
-        "MarketCap": 123_000_000,
-    })
+    _seed_nasdaq_db(output, [
+        {"symbol": "AAPL", "name": "Apple Inc.", "sector": "Technology", "industry": "Hardware", "marketCap": 100},
+        {"symbol": "MSFT", "name": "Microsoft Corporation", "sector": "Technology", "industry": "Software", "marketCap": 200},
+    ])
     def fake_fetch_daily_bars(symbols, **kwargs):
         bootstrapped = pd.read_csv(output)
         assert set(bootstrapped["Symbol"]) == {"AAPL", "MSFT"}

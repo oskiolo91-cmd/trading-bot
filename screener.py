@@ -7,20 +7,16 @@ import argparse
 import logging
 import math
 import os
-import random
 import tempfile
 import threading
-import time as time_module
 
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import yfinance as yf
 
 from alpaca_data import fetch_daily_bars
 from backtest import download_daily_bars, load_ohlcv_csv, prepare_data
@@ -30,12 +26,21 @@ LOG = logging.getLogger(__name__)
 # The local CSV is treated as a lightweight database: the dashboard reads it immediately and the
 # background worker updates it asynchronously as data is fetched for each ticker.
 MARKET_RADAR_PATH = Path(__file__).resolve().with_name("market_radar.csv")
+NASDAQ_DB_PATH = Path(__file__).resolve().with_name("nasdaq_screener.csv")
+NASDAQ_SCREENER_URL = (
+    "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=25&offset=0&download=true"
+)
+NASDAQ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/114.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "application/json, text/plain, */*",
+}
 _RADAR_FILE_LOCK = threading.RLock()
 _RADAR_WORKER_LOCK = threading.Lock()
 _RADAR_WORKERS: dict[str, threading.Thread] = {}
 _RADAR_WORKER_STATUS: dict[str, dict[str, Any]] = {}
 RADAR_COLUMNS = [
-    "Symbol", "Sector", "QuoteType", "MarketCap", "Close", "Volume_SMA20",
+    "Symbol", "SecurityName", "Sector", "Industry", "QuoteType", "MarketCap", "Close", "Volume_SMA20",
     "ADX", "ATR_pct", "RSI", "BB_lower", "SMA_200",
     "Validatore_Scalper", "Validatore_Trend",
 ]
@@ -44,7 +49,9 @@ RADAR_COLUMNS = [
 def _empty_radar_row(symbol: str) -> dict[str, Any]:
     return {
         "Symbol": symbol,
+        "SecurityName": "Unknown",
         "Sector": "Unknown",
+        "Industry": "Unknown",
         "QuoteType": "Equity",
         "MarketCap": None,
         "Close": float("nan"),
@@ -113,6 +120,90 @@ def initialize_market_radar(
             _write_market_radar(initialized, path)
             current = initialized
     return current
+
+
+def resolve_nasdaq_db_path(output_path: str | Path | None = None) -> Path:
+    if output_path is not None:
+        return Path(output_path).parent / "nasdaq_screener.csv"
+    return NASDAQ_DB_PATH
+
+
+def update_nasdaq_db(output_path: str | Path | None = None) -> pd.DataFrame:
+    """Download and atomically persist Nasdaq's public stock screener reference data."""
+    path = Path(output_path) if output_path is not None else NASDAQ_DB_PATH
+    response = requests.get(NASDAQ_SCREENER_URL, headers=NASDAQ_HEADERS, timeout=30)
+    response.raise_for_status()
+    rows = response.json()["data"]["rows"]
+    if not rows:
+        raise ValueError("Nasdaq returned an empty symbol catalog")
+
+    frame = pd.DataFrame(rows)
+    required_fields = {"symbol", "name", "sector", "industry", "marketCap"}
+    missing = required_fields - set(frame.columns)
+    if missing:
+        raise ValueError(f"Nasdaq response is missing fields: {', '.join(sorted(missing))}")
+    frame = frame[["symbol", "name", "sector", "industry", "marketCap"]].copy()
+    frame["symbol"] = frame["symbol"].fillna("").astype(str).str.strip().str.upper().str.replace(".", "-", regex=False)
+    frame = frame[frame["symbol"].ne("")].drop_duplicates("symbol", keep="last")
+    frame["marketCap"] = pd.to_numeric(
+        frame["marketCap"].astype(str).str.replace(r"[$,]", "", regex=True), errors="coerce"
+    )
+    for column in ("name", "sector", "industry"):
+        frame[column] = frame[column].replace({"N/A": pd.NA, "": pd.NA})
+    if frame.empty:
+        raise ValueError("Nasdaq response contained no usable symbols")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", suffix=".csv",
+            prefix=f".{path.name}.", dir=path.parent, delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            frame.to_csv(temporary_file, index=False)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    return frame
+
+
+def _load_nasdaq_db(output_path: str | Path | None = None) -> pd.DataFrame:
+    path = resolve_nasdaq_db_path(output_path)
+    if not path.exists():
+        update_nasdaq_db(path)
+    frame = pd.read_csv(path)
+    if "symbol" not in frame.columns:
+        raise ValueError(f"Nasdaq database has no symbol column: {path}")
+    frame["symbol"] = frame["symbol"].fillna("").astype(str).str.strip().str.upper().str.replace(".", "-", regex=False)
+    frame = frame.dropna(subset=["symbol"]).drop_duplicates("symbol", keep="last")
+    return frame.set_index("symbol")
+
+
+def _nasdaq_metadata(nasdaq_db: pd.DataFrame, symbol: str) -> dict[str, Any]:
+    symbol = str(symbol).strip().upper().replace(".", "-")
+    if symbol not in nasdaq_db.index:
+        return {"SecurityName": "Unknown", "Sector": "Unknown", "Industry": "Unknown", "MarketCap": None}
+    record = nasdaq_db.loc[symbol]
+    if isinstance(record, pd.DataFrame):
+        record = record.iloc[-1]
+
+    def value_or_unknown(field: str) -> str:
+        value = record.get(field)
+        return "Unknown" if _metadata_value_is_missing(value) else str(value)
+
+    market_cap = record.get("marketCap")
+    try:
+        market_cap = int(float(market_cap)) if not _metadata_value_is_missing(market_cap) else None
+    except (TypeError, ValueError, OverflowError):
+        market_cap = None
+    return {
+        "SecurityName": value_or_unknown("name"),
+        "Sector": value_or_unknown("sector"),
+        "Industry": value_or_unknown("industry"),
+        "MarketCap": market_cap,
+    }
 
 
 def _upsert_market_radar_rows(rows: list[dict[str, Any]], output_path: Path) -> pd.DataFrame:
@@ -272,10 +363,6 @@ def load_index_universe() -> list[str]:
     return list(dict.fromkeys(symbols))
 
 
-def _yahoo_symbol(symbol: str) -> str:
-    return symbol.replace(".", "-")
-
-
 def _metadata_value_is_missing(value: Any) -> bool:
     if value is None or value is pd.NA:
         return True
@@ -283,153 +370,6 @@ def _metadata_value_is_missing(value: Any) -> bool:
         return True
     text = str(value).strip()
     return text == "" or text.lower() == "unknown"
-
-
-def _read_cached_market_radar_metadata(output_path: str | Path) -> dict[str, dict[str, Any]]:
-    path = Path(output_path)
-    if not path.exists():
-        return {}
-    try:
-        cached = pd.read_csv(path)
-    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
-        return {}
-    if cached.empty:
-        return {}
-
-    metadata_by_symbol: dict[str, dict[str, Any]] = {}
-    for row in cached.to_dict("records"):
-        symbol = str(row.get("Symbol", "")).strip()
-        if not symbol:
-            continue
-        sector = row.get("Sector")
-        quote_type = row.get("QuoteType")
-        market_cap = row.get("MarketCap")
-        market_cap_value = None
-        if market_cap is not None and not _metadata_value_is_missing(market_cap):
-            try:
-                market_cap_value = int(market_cap)
-            except (TypeError, ValueError):
-                market_cap_value = None
-        metadata_by_symbol[symbol] = {
-            "Sector": str(sector) if not _metadata_value_is_missing(sector) else "Unknown",
-            "QuoteType": str(quote_type) if not _metadata_value_is_missing(quote_type) else "Equity",
-            "MarketCap": market_cap_value,
-        }
-    return metadata_by_symbol
-
-
-def _merge_metadata_with_cache(cached: dict[str, Any], fresh: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(cached or {})
-    for field, fallback in {
-        "Sector": "Unknown",
-        "QuoteType": "Equity",
-        "MarketCap": None,
-    }.items():
-        value = fresh.get(field)
-        if field == "MarketCap" and value is not None:
-            try:
-                value = int(value)
-            except (TypeError, ValueError):
-                value = None
-        if field in {"Sector", "QuoteType"} and _metadata_value_is_missing(value):
-            value = merged.get(field) or fallback
-        if field == "MarketCap" and _metadata_value_is_missing(value):
-            value = merged.get(field)
-        if value is None and field == "MarketCap":
-            merged[field] = None
-        elif not _metadata_value_is_missing(value):
-            merged[field] = value
-        elif field in merged and not _metadata_value_is_missing(merged.get(field)):
-            continue
-        else:
-            merged[field] = fallback
-    return merged
-
-
-def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    })
-
-    try:
-        ticker = yf.Ticker(_yahoo_symbol(symbol), session=session)
-    except TypeError:
-        ticker = yf.Ticker(_yahoo_symbol(symbol))
-
-    info: dict[str, Any] = {}
-    last_error: Exception | None = None
-    rate_limited = False
-
-    for attempt in range(3):
-        try:
-            candidate = ticker.get_info() or {}
-            if candidate:
-                info = candidate
-                break
-        except Exception as exc:
-            last_error = exc
-            message = str(exc).lower()
-            if "too many requests" in message or "429" in message or "rate limit" in message:
-                rate_limited = True
-                LOG.warning("Rate limit raggiunto, pausa di 60 secondi... (%s)", symbol)
-                time_module.sleep(60)
-                break
-            LOG.warning("Metadata fetch failed for %s (attempt %s/3): %s", symbol, attempt + 1, exc)
-
-        try:
-            fast_info = getattr(ticker, "fast_info", None)
-            if fast_info is not None:
-                merged = dict(info)
-                market_cap = getattr(fast_info, "market_cap", None)
-                if market_cap is not None and "marketCap" not in merged:
-                    merged["marketCap"] = market_cap
-                quote_type = getattr(fast_info, "quote_type", None)
-                if quote_type is not None and "quoteType" not in merged:
-                    merged["quoteType"] = quote_type
-                if merged:
-                    info = merged
-                    break
-        except Exception:
-            pass
-
-        if attempt < 2:
-            time_module.sleep(0.5 * (attempt + 1))
-
-    if rate_limited:
-        return {
-            "Sector": "Unknown",
-            "QuoteType": "Equity",
-            "MarketCap": None,
-        }
-
-    if not info and last_error is not None:
-        LOG.warning("Using fallback metadata for %s after repeated Yahoo failures", symbol)
-
-    raw_quote_type = str(info.get("quoteType") or "").upper()
-    quote_type = "ETF" if raw_quote_type == "ETF" else "Equity" if raw_quote_type in {"EQUITY", "", "STOCK"} else raw_quote_type
-    market_cap = info.get("marketCap")
-    if market_cap is None:
-        fast_info = getattr(ticker, "fast_info", None)
-        if fast_info is not None:
-            market_cap = getattr(fast_info, "market_cap", None)
-    sector = info.get("sector") or info.get("industry") or "Unknown"
-
-    time_module.sleep(random.uniform(1.5, 3.0))
-
-    return {
-        "Sector": str(sector),
-        "QuoteType": quote_type,
-        "MarketCap": int(market_cap) if market_cap is not None else None,
-    }
 
 
 def _last_closed_bars(frame: pd.DataFrame, market_is_open: bool) -> pd.DataFrame:
@@ -477,6 +417,30 @@ def _radar_row(symbol: str, bars: pd.DataFrame, metadata: dict[str, Any]) -> dic
     }
 
 
+def sync_market_radar_metadata(output_path: str | Path | None = None) -> None:
+    """Apply the local Nasdaq master to existing radar rows without changing financial fields."""
+    radar_path = resolve_market_radar_path(output_path)
+    try:
+        nasdaq_db = _load_nasdaq_db(radar_path)
+    except Exception:
+        LOG.exception("Could not load Nasdaq security master for radar sync")
+        raise
+
+    radar = _read_market_radar(radar_path)
+    rows: list[dict[str, Any]] = []
+    for record in radar.to_dict("records"):
+        symbol = str(record["Symbol"])
+        metadata = _nasdaq_metadata(nasdaq_db, symbol)
+        for field in ("SecurityName", "Sector", "Industry"):
+            if _metadata_value_is_missing(metadata[field]):
+                metadata[field] = record.get(field, "Unknown")
+        if metadata["MarketCap"] is None:
+            metadata["MarketCap"] = record.get("MarketCap")
+        rows.append({"Symbol": symbol, **metadata})
+    if rows:
+        _upsert_market_radar_rows(rows, radar_path)
+
+
 def generate_market_radar(
     symbols: list[str] | None = None,
     output_path: str | Path | None = None,
@@ -495,7 +459,14 @@ def generate_market_radar(
         raise ValueError("batch_size must be at least 1")
 
     initialize_market_radar(symbols, output_path)
-    cached_metadata = _read_cached_market_radar_metadata(output_path)
+    try:
+        nasdaq_db = _load_nasdaq_db(output_path)
+    except Exception:
+        LOG.exception("Nasdaq security master unavailable; continuing with cached metadata")
+        nasdaq_db = pd.DataFrame(columns=["name", "sector", "industry", "marketCap"])
+        nasdaq_db.index.name = "symbol"
+    cached_radar = _read_market_radar(Path(output_path))
+    cached_metadata = cached_radar.set_index("Symbol").to_dict("index") if not cached_radar.empty else {}
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=400)
     if trading_client is None:
@@ -512,32 +483,16 @@ def generate_market_radar(
     for offset in range(0, len(symbols), batch_size):
         batch = symbols[offset:offset + batch_size]
         metadata_by_symbol: dict[str, dict[str, Any]] = {}
-        missing_metadata = [
-            symbol for symbol in batch
-            if _metadata_value_is_missing(cached_metadata.get(symbol, {}).get("Sector"))
-        ]
-        if not missing_metadata:
-            for symbol in batch:
-                metadata_by_symbol[symbol] = cached_metadata.get(symbol, {
-                    "Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None,
-                })
-        else:
-            for symbol in missing_metadata:
-                try:
-                    fresh = _fetch_yahoo_metadata(symbol)
-                except Exception:
-                    LOG.exception("Could not load metadata for %s", symbol)
-                    fresh = {"Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None}
-                cached_metadata[symbol] = _merge_metadata_with_cache(cached_metadata.get(symbol, {}), fresh)
-            for symbol in batch:
-                metadata_by_symbol[symbol] = cached_metadata.get(symbol, {
-                    "Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None,
-                })
-
         for symbol in batch:
-            metadata_by_symbol[symbol] = cached_metadata.get(symbol, {
-                "Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None,
-            })
+            metadata = _nasdaq_metadata(nasdaq_db, symbol)
+            cached = cached_metadata.get(symbol, {})
+            for field in ("SecurityName", "Sector", "Industry"):
+                if _metadata_value_is_missing(metadata[field]):
+                    metadata[field] = cached.get(field, "Unknown")
+            if metadata["MarketCap"] is None:
+                metadata["MarketCap"] = cached.get("MarketCap")
+            metadata["QuoteType"] = cached.get("QuoteType", "Equity")
+            metadata_by_symbol[symbol] = metadata
         alpaca_symbols = [symbol.replace("-", ".") for symbol in batch]
         try:
             frames = fetch_daily_bars(alpaca_symbols, start=start, end=end, client=data_client)
@@ -566,7 +521,7 @@ def generate_market_radar(
 
 
 def main(argv=None) -> pd.DataFrame:
-    parser = argparse.ArgumentParser(description="Build the Alpaca/yfinance market radar CSV")
+    parser = argparse.ArgumentParser(description="Build the Alpaca/Nasdaq market radar CSV")
     parser.add_argument("--symbols", help="Comma-separated symbols; defaults to S&P 500 + Nasdaq 100")
     parser.add_argument("--output", default=str(MARKET_RADAR_PATH))
     args = parser.parse_args(argv)

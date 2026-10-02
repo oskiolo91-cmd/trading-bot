@@ -1255,6 +1255,20 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     search_query = search_col.text_input("Cerca nel radar", key="radar_search")
     radar_path = resolve_market_radar_path(BOT_DIR / "market_radar.csv")
 
+    if st.session_state.pop("nasdaq_sync_message", None):
+        st.success("Database Nasdaq aggiornato.")
+    if st.button("Aggiorna Anagrafica Nasdaq", key="update_nasdaq_security_master"):
+        try:
+            from screener import sync_market_radar_metadata, update_nasdaq_db
+
+            with st.spinner("Download dati dal Nasdaq in corso..."):
+                update_nasdaq_db()
+                sync_market_radar_metadata(radar_path)
+            st.session_state["nasdaq_sync_message"] = True
+            st.rerun(scope="app")
+        except Exception as exc:
+            st.error(f"Aggiornamento anagrafica Nasdaq non riuscito: {exc}")
+
     radar_service = None
     if trading_client is not None and available_symbols:
         try:
@@ -1331,6 +1345,9 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     if missing:
         st.error(f"market_radar.csv non contiene: {', '.join(missing)}")
         return selected_symbols
+    for column in ("SecurityName", "Industry"):
+        if column not in radar.columns:
+            radar[column] = "Unknown"
 
     sectors = sorted(radar["Sector"].dropna().astype(str).unique())
     quote_types = sorted(radar["QuoteType"].dropna().astype(str).unique())
