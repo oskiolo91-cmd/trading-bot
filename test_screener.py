@@ -181,6 +181,30 @@ def test_generate_market_radar_creates_missing_output_directory(tmp_path, monkey
     assert stored.loc[0, "Sector"] == "Technology"
 
 
+def test_initialize_market_radar_bootstraps_and_preserves_existing_data(tmp_path):
+    output = tmp_path / "market_radar.csv"
+    output.write_text("")
+
+    initial = screener.initialize_market_radar(["SPY", "AAPL"], output)
+
+    assert initial["Symbol"].tolist() == ["SPY", "AAPL"]
+    assert set(initial.columns) == set(screener.RADAR_COLUMNS)
+    assert initial["Sector"].tolist() == ["Unknown", "Unknown"]
+    assert pd.isna(initial.loc[0, "Close"])
+
+    initial.loc[initial["Symbol"] == "AAPL", "Sector"] = "Technology"
+    initial.loc[initial["Symbol"] == "AAPL", "Close"] = 200.0
+    initial.to_csv(output, index=False)
+    updated = screener.initialize_market_radar(["AAPL", "MSFT"], output)
+
+    apple = updated.loc[updated["Symbol"] == "AAPL"].iloc[0]
+    microsoft = updated.loc[updated["Symbol"] == "MSFT"].iloc[0]
+    assert apple["Sector"] == "Technology"
+    assert apple["Close"] == 200.0
+    assert microsoft["Sector"] == "Unknown"
+    assert pd.isna(microsoft["Close"])
+
+
 def test_generate_market_radar_writes_progressively_to_csv(monkeypatch, tmp_path):
     dates = pd.date_range("2025-01-01", periods=220, freq="B", tz="UTC")
     close = pd.Series(np.linspace(100, 120, len(dates)), index=dates)
@@ -201,7 +225,13 @@ def test_generate_market_radar_writes_progressively_to_csv(monkeypatch, tmp_path
         "QuoteType": "Equity",
         "MarketCap": 123_000_000,
     })
-    monkeypatch.setattr(screener, "fetch_daily_bars", lambda symbols, **kwargs: {symbol: frame for symbol in symbols})
+    def fake_fetch_daily_bars(symbols, **kwargs):
+        bootstrapped = pd.read_csv(output)
+        assert set(bootstrapped["Symbol"]) == {"AAPL", "MSFT"}
+        assert bootstrapped["Close"].isna().all()
+        return {symbol: frame for symbol in symbols}
+
+    monkeypatch.setattr(screener, "fetch_daily_bars", fake_fetch_daily_bars)
 
     class FakeTradingClient:
         def get_clock(self):

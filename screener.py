@@ -6,6 +6,9 @@ import asyncio
 import argparse
 import logging
 import math
+import os
+import tempfile
+import threading
 import time as time_module
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta, timezone
@@ -24,11 +27,174 @@ LOG = logging.getLogger(__name__)
 # The local CSV is treated as a lightweight database: the dashboard reads it immediately and the
 # background worker updates it asynchronously as data is fetched for each ticker.
 MARKET_RADAR_PATH = Path(__file__).resolve().with_name("market_radar.csv")
+_RADAR_FILE_LOCK = threading.RLock()
+_RADAR_WORKER_LOCK = threading.Lock()
+_RADAR_WORKERS: dict[str, threading.Thread] = {}
+_RADAR_WORKER_STATUS: dict[str, dict[str, Any]] = {}
 RADAR_COLUMNS = [
     "Symbol", "Sector", "QuoteType", "MarketCap", "Close", "Volume_SMA20",
     "ADX", "ATR_pct", "RSI", "BB_lower", "SMA_200",
     "Validatore_Scalper", "Validatore_Trend",
 ]
+
+
+def _empty_radar_row(symbol: str) -> dict[str, Any]:
+    return {
+        "Symbol": symbol,
+        "Sector": "Unknown",
+        "QuoteType": "Equity",
+        "MarketCap": None,
+        "Close": float("nan"),
+        "Volume_SMA20": float("nan"),
+        "ADX": float("nan"),
+        "ATR_pct": float("nan"),
+        "RSI": float("nan"),
+        "BB_lower": float("nan"),
+        "SMA_200": float("nan"),
+        "Validatore_Scalper": False,
+        "Validatore_Trend": False,
+    }
+
+
+def _write_market_radar(frame: pd.DataFrame, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized = frame.reindex(columns=RADAR_COLUMNS)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", suffix=".csv",
+            prefix=f".{output_path.name}.", dir=output_path.parent, delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            normalized.to_csv(temporary_file, index=False)
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _read_market_radar(output_path: Path) -> pd.DataFrame:
+    if not output_path.exists():
+        return pd.DataFrame(columns=RADAR_COLUMNS)
+    try:
+        frame = pd.read_csv(output_path)
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+        LOG.exception("Could not read market radar CSV at %s", output_path)
+        return pd.DataFrame(columns=RADAR_COLUMNS)
+    for column in RADAR_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = _empty_radar_row("")[column]
+    frame = frame[RADAR_COLUMNS]
+    if "Symbol" in frame:
+        frame = frame.dropna(subset=["Symbol"]).drop_duplicates("Symbol", keep="last")
+        frame["Symbol"] = frame["Symbol"].astype(str)
+    return frame
+
+
+def initialize_market_radar(
+    symbols: list[str], output_path: str | Path | None = None,
+) -> pd.DataFrame:
+    """Persist catalog rows immediately, retaining any existing metadata and financial data."""
+    path = resolve_market_radar_path(output_path)
+    catalog = list(dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip()))
+    with _RADAR_FILE_LOCK:
+        current = _read_market_radar(path)
+        existing_symbols = set(current["Symbol"].astype(str)) if not current.empty else set()
+        missing_rows = [_empty_radar_row(symbol) for symbol in catalog if symbol not in existing_symbols]
+        try:
+            existing_columns = pd.read_csv(path, nrows=0).columns.tolist() if path.exists() else []
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+            existing_columns = []
+        if missing_rows or existing_columns != RADAR_COLUMNS:
+            initialized = pd.concat([current, pd.DataFrame(missing_rows, columns=RADAR_COLUMNS)], ignore_index=True)
+            _write_market_radar(initialized, path)
+            current = initialized
+    return current
+
+
+def _upsert_market_radar_rows(rows: list[dict[str, Any]], output_path: Path) -> pd.DataFrame:
+    with _RADAR_FILE_LOCK:
+        current = _read_market_radar(output_path)
+        if not current.empty:
+            current = current.set_index("Symbol")
+        else:
+            current = pd.DataFrame(columns=RADAR_COLUMNS).set_index("Symbol")
+        for row in rows:
+            symbol = str(row["Symbol"])
+            if symbol not in current.index:
+                current.loc[symbol] = {
+                    column: value
+                    for column, value in _empty_radar_row(symbol).items()
+                    if column != "Symbol"
+                }
+            for column, value in row.items():
+                if column in RADAR_COLUMNS and column != "Symbol":
+                    current.loc[symbol, column] = value
+        updated = current.reset_index().reindex(columns=RADAR_COLUMNS)
+        _write_market_radar(updated, output_path)
+    return updated
+
+
+def get_market_radar_worker_status(output_path: str | Path | None = None) -> dict[str, Any]:
+    path = str(resolve_market_radar_path(output_path).resolve())
+    with _RADAR_WORKER_LOCK:
+        return dict(_RADAR_WORKER_STATUS.get(path, {"state": "idle", "completed": 0, "total": 0, "error": None}))
+
+
+def start_market_radar_worker(
+    symbols: list[str],
+    output_path: str | Path | None = None,
+    force: bool = False,
+    **generation_options,
+) -> bool:
+    """Start one daemon worker per CSV path; safe to call on every Streamlit rerun."""
+    path = resolve_market_radar_path(output_path)
+    key = str(path.resolve())
+    catalog = list(dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip()))
+    if not catalog:
+        return False
+    initialize_market_radar(catalog, path)
+    with _RADAR_WORKER_LOCK:
+        worker = _RADAR_WORKERS.get(key)
+        if worker is not None and worker.is_alive():
+            return False
+        previous_status = _RADAR_WORKER_STATUS.get(key, {})
+        same_catalog = previous_status.get("symbols") == catalog
+        if previous_status.get("state") in {"complete", "failed"} and same_catalog and not force:
+            return False
+        _RADAR_WORKER_STATUS[key] = {
+            "state": "running", "completed": 0, "total": len(catalog),
+            "error": None, "symbols": catalog,
+        }
+
+        def update_progress(partial: pd.DataFrame) -> None:
+            with _RADAR_WORKER_LOCK:
+                _RADAR_WORKER_STATUS[key]["completed"] = len(partial)
+
+        def run_worker() -> None:
+            try:
+                generate_market_radar(
+                    symbols=catalog,
+                    output_path=path,
+                    progress_callback=update_progress,
+                    **generation_options,
+                )
+            except Exception as exc:
+                LOG.exception("Market radar background worker failed")
+                with _RADAR_WORKER_LOCK:
+                    _RADAR_WORKER_STATUS[key].update(state="failed", error=str(exc))
+            else:
+                with _RADAR_WORKER_LOCK:
+                    _RADAR_WORKER_STATUS[key].update(state="complete", completed=len(catalog))
+
+        worker = threading.Thread(
+            target=run_worker,
+            name=f"market-radar-{path.stem}",
+            daemon=True,
+        )
+        _RADAR_WORKERS[key] = worker
+        worker.start()
+    return True
 
 
 def resolve_market_radar_path(output_path: str | Path | None = None) -> Path:
@@ -122,7 +288,7 @@ def _read_cached_market_radar_metadata(output_path: str | Path) -> dict[str, dic
         return {}
     try:
         cached = pd.read_csv(path)
-    except Exception:
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
         return {}
     if cached.empty:
         return {}
@@ -265,35 +431,18 @@ def generate_market_radar(
     progress_callback=None,
     batch_size: int = 50,
 ) -> pd.DataFrame:
-    """Build market_radar.csv using batched Alpaca daily bars and Yahoo metadata."""
+    """Enrich the bootstrapped local catalog in small, durable chunks."""
     output_path = resolve_market_radar_path(output_path)
-    symbols = list(dict.fromkeys(symbols or load_index_universe()))
+    symbols = list(dict.fromkeys(symbols if symbols is not None else load_index_universe()))
     if not symbols:
         raise ValueError("At least one ticker is required")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
 
+    initialize_market_radar(symbols, output_path)
     cached_metadata = _read_cached_market_radar_metadata(output_path)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=400)
-    metadata_by_symbol: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=metadata_workers) as executor:
-        futures = {executor.submit(_fetch_yahoo_metadata, symbol): symbol for symbol in symbols}
-        for future in as_completed(futures):
-            symbol = futures[future]
-            previous = cached_metadata.get(symbol, {})
-            try:
-                fresh = future.result()
-            except Exception:
-                LOG.exception("Could not load metadata for %s", symbol)
-                fresh = {"Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None}
-            metadata_by_symbol[symbol] = _merge_metadata_with_cache(previous, fresh)
-
-    for symbol in symbols:
-        metadata_by_symbol.setdefault(symbol, cached_metadata.get(symbol, {
-            "Sector": "Unknown",
-            "QuoteType": "Equity",
-            "MarketCap": None,
-        }))
-
     if trading_client is None:
         from live_trader import get_alpaca_client
 
@@ -304,30 +453,54 @@ def generate_market_radar(
         LOG.warning("Could not read Alpaca market clock; today's bar will be excluded")
         market_is_open = True
 
-    rows: list[dict[str, Any]] = []
+    completed_rows: list[dict[str, Any]] = []
     for offset in range(0, len(symbols), batch_size):
         batch = symbols[offset:offset + batch_size]
+        metadata_by_symbol: dict[str, dict[str, Any]] = {}
+        missing_metadata = [
+            symbol for symbol in batch
+            if _metadata_value_is_missing(cached_metadata.get(symbol, {}).get("Sector"))
+        ]
+        with ThreadPoolExecutor(max_workers=max(1, min(metadata_workers, len(missing_metadata)))) as executor:
+            futures = {executor.submit(_fetch_yahoo_metadata, symbol): symbol for symbol in missing_metadata}
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    fresh = future.result()
+                except Exception:
+                    LOG.exception("Could not load metadata for %s", symbol)
+                    fresh = {"Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None}
+                cached_metadata[symbol] = _merge_metadata_with_cache(cached_metadata.get(symbol, {}), fresh)
+
+        for symbol in batch:
+            metadata_by_symbol[symbol] = cached_metadata.get(symbol, {
+                "Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None,
+            })
         alpaca_symbols = [symbol.replace("-", ".") for symbol in batch]
-        frames = fetch_daily_bars(alpaca_symbols, start=start, end=end, client=data_client)
+        try:
+            frames = fetch_daily_bars(alpaca_symbols, start=start, end=end, client=data_client)
+        except Exception:
+            LOG.exception("Could not load Alpaca bars for market radar batch %s", batch)
+            frames = {}
+
+        rows_to_write: list[dict[str, Any]] = []
         for symbol, alpaca_symbol in zip(batch, alpaca_symbols):
             frame = _last_closed_bars(frames.get(alpaca_symbol, pd.DataFrame()), market_is_open)
             try:
-                rows.append(_radar_row(symbol, frame, metadata_by_symbol[symbol]))
+                if frame.empty:
+                    raise ValueError("No Alpaca bars available")
+                row = _radar_row(symbol, frame, metadata_by_symbol[symbol])
             except Exception as exc:
-                LOG.warning("Skipping %s from market radar: %s", symbol, exc)
+                LOG.warning("Keeping %s in market radar without fresh financial data: %s", symbol, exc)
+                row = {"Symbol": symbol, **metadata_by_symbol[symbol]}
+            rows_to_write.append(row)
+            completed_rows.append(row)
 
-        partial = pd.DataFrame(rows, columns=RADAR_COLUMNS)
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        partial.to_csv(output_path, index=False)
+        current = _upsert_market_radar_rows(rows_to_write, Path(output_path))
         if progress_callback is not None:
-            progress_callback(partial)
+            progress_callback(pd.DataFrame(completed_rows))
 
-    radar = pd.DataFrame(rows, columns=RADAR_COLUMNS)
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    radar.to_csv(output_path, index=False)
-    return radar
+    return _read_market_radar(Path(output_path)).reindex(columns=RADAR_COLUMNS)
 
 
 def main(argv=None) -> pd.DataFrame:

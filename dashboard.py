@@ -1249,47 +1249,73 @@ def paginate_market_radar(filtered: pd.DataFrame, page: int, page_size: int) -> 
 
 def render_market_explorer(positions: dict, available_symbols: list[str], trading_client=None) -> list[str]:
     st.subheader("Tutti i ticker")
-    # CSV-backed bootstrap: if the local market_radar.csv is missing, the dashboard starts a background
-    # worker that fills the file progressively without blocking the app UI.
-    st.session_state.setdefault("market_radar_generation_started", False)
     st.session_state["market_radar_visible_symbols"] = []
     search_col, sector_col, type_col = st.columns([1.6, 1.4, 1.2])
     selected_symbols = []
     search_query = search_col.text_input("Cerca nel radar", key="radar_search")
     radar_path = resolve_market_radar_path(BOT_DIR / "market_radar.csv")
+
+    radar_service = None
+    if trading_client is not None and available_symbols:
+        try:
+            from screener import (
+                get_market_radar_worker_status,
+                initialize_market_radar,
+                start_market_radar_worker,
+            )
+
+            initialize_market_radar(available_symbols, radar_path)
+            key, secret, _ = _live_credentials()
+            if key and secret:
+                start_market_radar_worker(
+                    available_symbols,
+                    output_path=radar_path,
+                    trading_client=trading_client,
+                    data_client=StockHistoricalDataClient(key, secret),
+                    batch_size=25,
+                )
+            radar_service = get_market_radar_worker_status(radar_path)
+        except Exception as exc:
+            st.warning(f"Bootstrap del radar non riuscito: {exc}")
+
     if not radar_path.exists():
         if trading_client is None:
             st.info("Connessione Alpaca non disponibile. Configura ALPACA_API_KEY e ALPACA_SECRET_KEY nei Secrets dell'app.")
         elif not available_symbols:
             st.info("Connessione Alpaca attiva, ma non risultano asset USA attivi, tradabili e frazionabili.")
-        else:
-            generation_started = st.session_state.get("market_radar_generation_started", False)
-            if not generation_started:
-                key, secret, _ = _live_credentials()
-
-                def _background_generate_market_radar():
-                    try:
-                        from screener import generate_market_radar
-
-                        generate_market_radar(
-                            symbols=available_symbols,
-                            output_path=radar_path,
-                            trading_client=trading_client,
-                            data_client=StockHistoricalDataClient(key, secret),
-                            batch_size=25,
-                        )
-                    finally:
-                        st.session_state["market_radar_generation_started"] = False
-
-                st.session_state["market_radar_generation_started"] = True
-                threading.Thread(target=_background_generate_market_radar, daemon=True).start()
-
-            st.info("Generazione radar in corso: i ticker compaiono man mano mentre il file locale viene aggiornato.")
-            if st.button("Aggiorna vista", key="refresh_market_radar_generation"):
-                st.rerun(scope="app")
-            if st.session_state.get("market_radar_generation_started") is False and radar_path.exists():
-                st.rerun(scope="app")
+        elif radar_service and radar_service.get("error"):
+            st.error(f"Aggiornamento radar non riuscito: {radar_service['error']}")
         return selected_symbols
+
+    status_column, refresh_column = st.columns([4, 1])
+    if radar_service:
+        state = radar_service.get("state", "idle")
+        if state == "running":
+            status_column.caption(
+                f"Aggiornamento in background: {radar_service.get('completed', 0)} / "
+                f"{radar_service.get('total', 0)} ticker elaborati."
+            )
+        elif state == "failed":
+            status_column.warning(f"Aggiornamento interrotto: {radar_service.get('error')}")
+            if refresh_column.button("Riprova aggiornamento", key="retry_market_radar"):
+                key, secret, _ = _live_credentials()
+                if key and secret:
+                    from screener import start_market_radar_worker
+
+                    start_market_radar_worker(
+                        available_symbols,
+                        output_path=radar_path,
+                        force=True,
+                        trading_client=trading_client,
+                        data_client=StockHistoricalDataClient(key, secret),
+                        batch_size=25,
+                    )
+                    st.rerun(scope="app")
+        elif state == "complete":
+            status_column.caption("Catalogo aggiornato; dati letti dal CSV locale.")
+    if refresh_column.button("Aggiorna Tabella", key="refresh_market_radar_table"):
+        st.rerun(scope="app")
+
     try:
         radar = pd.read_csv(radar_path)
     except Exception as exc:
