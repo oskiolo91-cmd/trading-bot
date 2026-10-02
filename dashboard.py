@@ -167,6 +167,15 @@ def _ticker_data_from_frame(symbol: str, frame: pd.DataFrame) -> dict:
     return values
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_market_detail_data(symbol: str, credential_scope: str, _data_client) -> dict:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=100)
+    alpaca_symbol = to_alpaca_symbol(symbol)
+    frame = fetch_daily_bars(alpaca_symbol, start, end, client=_data_client)[alpaca_symbol]
+    return _ticker_data_from_frame(symbol, frame)
+
+
 def compute_signal(data: dict, params: StrategyParams) -> bool:
     """Entry signal (ADX < max, RSI < max, price <= BB lower) evaluated with the given profile."""
     values = [data.get(name) for name in ("price", "adx", "rsi", "bb_lower")]
@@ -230,7 +239,13 @@ def backtest_table(results: dict[str, BacktestResult]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["Profilo", "Rendimento %", "Win rate %", "Max drawdown %", "N. trade"])
 
 
-def render_candlestick_chart(client, symbol: str, ticker_data: dict, params: StrategyParams) -> None:
+def render_candlestick_chart(
+    client,
+    symbol: str,
+    ticker_data: dict,
+    params: StrategyParams,
+    chart_key: str | None = None,
+) -> None:
     data = ticker_data.get("chart_data")
     if not isinstance(data, pd.DataFrame) or data.empty:
         st.info(f"Grafico di {symbol} in attesa delle barre Alpaca.")
@@ -363,9 +378,9 @@ def render_candlestick_chart(client, symbol: str, ticker_data: dict, params: Str
     figure.update_yaxes(title_text="Volume", row=2, col=1)
     st.plotly_chart(
         figure,
-        use_container_width=True,
+        width="stretch",
         config={"responsive": True, "displaylogo": False},
-        key=f"candlestick_{symbol}",
+        key=chart_key or f"candlestick_{symbol}",
     )
 
 
@@ -1247,6 +1262,87 @@ def paginate_market_radar(filtered: pd.DataFrame, page: int, page_size: int) -> 
     return filtered.iloc[start:start + page_size].copy(), page_count
 
 
+def resolve_market_radar_selected_symbol(table: pd.DataFrame, selected_rows) -> str | None:
+    if table.empty or not selected_rows:
+        return None
+    try:
+        row_index = int(selected_rows[0])
+    except (TypeError, ValueError):
+        return None
+    if row_index < 0 or row_index >= len(table):
+        return None
+    symbol = table.iloc[row_index].get("Symbol")
+    return str(symbol) if symbol is not None else None
+
+
+def render_market_radar_detail(row: pd.Series, symbol: str) -> None:
+    st.markdown("---")
+    st.subheader(f"Dettaglio {symbol}")
+    info_column, chart_column = st.columns([1, 2], gap="large")
+
+    with info_column:
+        name = row.get("SecurityName", "")
+        if pd.notna(name) and str(name).strip():
+            st.markdown(f"**{name}**")
+        sector = row.get("Sector", "—")
+        industry = row.get("Industry", "—")
+        quote_type = row.get("QuoteType", "—")
+        st.write(f"**Settore:** {sector if pd.notna(sector) else '—'}")
+        st.write(f"**Industria:** {industry if pd.notna(industry) else '—'}")
+        st.write(f"**Tipo:** {quote_type if pd.notna(quote_type) else '—'}")
+        metrics = st.columns(2)
+        for column, label, field, suffix in (
+            (metrics[0], "Volume medio 20g", "Volume_SMA20", ""),
+            (metrics[1], "Market cap", "MarketCap", ""),
+            (metrics[0], "RSI", "RSI", ""),
+            (metrics[1], "ADX", "ADX", ""),
+            (metrics[0], "ATR", "ATR_pct", "%"),
+            (metrics[1], "Prezzo", "Close", " $"),
+        ):
+            value = _number_or_nan(row.get(field))
+            display_value = f"{value:,.2f}{suffix}" if math.isfinite(value) else "—"
+            column.metric(label, display_value)
+
+    with chart_column:
+        ticker_data = st.session_state.get("live_data", {}).get(symbol, {})
+        chart_data = ticker_data.get("chart_data")
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=100)
+        if isinstance(chart_data, pd.DataFrame) and not chart_data.empty:
+            recent_chart = chart_data.loc[pd.to_datetime(chart_data.index, utc=True) >= cutoff]
+            ticker_data = {**ticker_data, "chart_data": recent_chart}
+        else:
+            recent_chart = pd.DataFrame()
+
+        try:
+            if recent_chart.empty:
+                key, secret, _ = _live_credentials()
+                if not key or not secret:
+                    raise ValueError("Configura le chiavi Alpaca per caricare lo storico.")
+                credential_scope = hashlib.sha256(f"{key}:{secret}".encode()).hexdigest()
+                data_client = StockHistoricalDataClient(key, secret)
+                with st.spinner(f"Caricamento candele {symbol}..."):
+                    ticker_data = _cached_market_detail_data(symbol, credential_scope, data_client)
+            render_candlestick_chart(
+                None,
+                symbol,
+                ticker_data,
+                get_ticker_params(symbol),
+                chart_key=f"market_radar_candlestick_{symbol}",
+            )
+        except Exception as exc:
+            st.error(f"Grafico non disponibile per {symbol}: {exc}")
+
+        active_tickers = set(st.session_state.get("active_tickers", []))
+        if st.button(
+            f"➕ Aggiungi {symbol} ai Bot Attivi",
+            key=f"add_market_radar_ticker_{symbol}",
+            disabled=symbol in active_tickers,
+        ):
+            active_tickers.add(symbol)
+            st.session_state["active_tickers"] = sorted(active_tickers)
+            st.success(f"{symbol} aggiunto ai Bot Attivi.")
+
+
 def render_market_explorer(positions: dict, available_symbols: list[str], trading_client=None) -> list[str]:
     st.subheader("Tutti i ticker")
     st.session_state["market_radar_visible_symbols"] = []
@@ -1397,27 +1493,20 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
         active_tickers,
         st.session_state.get("live_data", {}),
     )
-    st.session_state["market_radar_detail_table"] = radar_table
-    visible_symbols = set(radar_table["Symbol"].astype(str))
-    edited = st.data_editor(
+    radar_table = radar_table.rename(columns={"Attiva Bot": "Bot attivo"})
+    selection_key = hashlib.sha256(
+        "\0".join(radar_table["Symbol"].astype(str)).encode()
+    ).hexdigest()[:12]
+    event = st.dataframe(
         radar_table,
         hide_index=True,
-        use_container_width=True,
-        disabled=[column for column in radar_table.columns if column not in {"Attiva Bot", "Symbol"}],
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
         column_config={
-            "Symbol": st.column_config.ButtonColumn(
-                "Ticker",
-                help="Clicca il ticker per aprire il dettaglio.",
-                on_click=_on_select_detail,
-                args=("market_radar_detail_table", "market_radar_table_click"),
-                key="market_radar_table_click",
-            ),
+            "Symbol": st.column_config.TextColumn("Ticker"),
             "Segnale": st.column_config.TextColumn("Segnale"),
-            "Attiva Bot": st.column_config.CheckboxColumn(
-                "Attiva Bot",
-                help="Aggiunge il ticker ai moduli del tab Controllo Bot.",
-                default=False,
-            ),
+            "Bot attivo": st.column_config.CheckboxColumn("Bot attivo"),
             "MarketCap": st.column_config.NumberColumn("Market Cap", format="$%d"),
             "Close": st.column_config.NumberColumn("Close", format="$%.2f"),
             "Prezzo dinamico ($)": st.column_config.NumberColumn("Prezzo attuale", format="$%.2f"),
@@ -1431,19 +1520,12 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
             "Validatore_Scalper": st.column_config.TextColumn("Scalper"),
             "Validatore_Trend": st.column_config.TextColumn("Trend"),
         },
-        key=f"market_radar_editor_{st.session_state[page_key]}_{radar_table['Symbol'].iloc[0]}_{radar_table['Symbol'].iloc[-1]}",
+        key=f"market_radar_dataframe_{selection_key}",
     )
-
-    updated_active = sync_market_editor_selection(
-        active_tickers,
-        visible_symbols,
-        edited,
-        positions,
-        st.session_state["bot_enabled"],
-    )
-    if updated_active != active_tickers:
-        st.session_state["active_tickers"] = sorted(updated_active)
-        st.rerun(scope="app")
+    selected_symbol = resolve_market_radar_selected_symbol(radar_table, event.selection.rows)
+    if selected_symbol:
+        selected_row = radar_table.loc[radar_table["Symbol"].astype(str) == selected_symbol].iloc[0]
+        render_market_radar_detail(selected_row, selected_symbol)
     return selected_symbols
 
 

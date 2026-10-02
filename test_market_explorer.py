@@ -73,6 +73,14 @@ def test_market_radar_pagination_returns_page_and_total_pages():
     assert page_count == 3
 
 
+def test_resolve_market_radar_selection_uses_selected_row():
+    table = pd.DataFrame({"Symbol": ["AAPL", "MSFT", "NVDA"]})
+
+    assert dashboard.resolve_market_radar_selected_symbol(table, [1]) == "MSFT"
+    assert dashboard.resolve_market_radar_selected_symbol(table, []) is None
+    assert dashboard.resolve_market_radar_selected_symbol(table, [4]) is None
+
+
 def test_personal_ticker_table_includes_live_metrics_signal_and_position_pnl():
     state = {
         "live_data": {
