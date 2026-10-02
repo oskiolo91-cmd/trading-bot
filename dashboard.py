@@ -62,30 +62,51 @@ def get_ticker_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=REFRESH_WORKERS, thread_name_prefix="ticker-refresh")
 
 
+def _is_active_tradable_equity(asset) -> bool:
+    return (
+        getattr(asset.status, "value", asset.status) == AssetStatus.ACTIVE.value
+        and bool(getattr(asset, "tradable", False))
+        and getattr(asset.asset_class, "value", asset.asset_class) == AssetClass.US_EQUITY.value
+    )
+
+
+def filter_tradable_equity_assets(assets) -> list[str]:
+    return sorted({
+        asset.symbol
+        for asset in assets
+        if _is_active_tradable_equity(asset)
+    })
+
+
 def filter_fractional_assets(assets) -> list[str]:
     return sorted({
         asset.symbol
         for asset in assets
-        if getattr(asset.status, "value", asset.status) == AssetStatus.ACTIVE.value
-        and asset.tradable
+        if _is_active_tradable_equity(asset)
         and getattr(asset, "fractionable", getattr(asset, "fractional_enabled", False))
-        and getattr(asset.asset_class, "value", asset.asset_class) == AssetClass.US_EQUITY.value
     })
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_fractional_asset_symbols(_trading_client, credential_scope: str) -> list[str]:
+def _cached_active_equity_symbols(_trading_client, credential_scope: str) -> tuple[list[str], list[str]]:
     asset_filter = GetAssetsRequest(
         status=AssetStatus.ACTIVE,
         asset_class=AssetClass.US_EQUITY,
-        attributes="fractionable",
     )
-    return filter_fractional_assets(_trading_client.get_all_assets(filter=asset_filter))
+    assets = _trading_client.get_all_assets(filter=asset_filter)
+    return filter_tradable_equity_assets(assets), filter_fractional_assets(assets)
+
+
+def get_tradable_equity_symbols(trading_client, api_key: str, secret_key: str) -> list[str]:
+    scope = hashlib.sha256(f"{api_key}:{secret_key}".encode()).hexdigest()
+    available, _ = _cached_active_equity_symbols(trading_client, scope)
+    return available
 
 
 def get_fractional_asset_symbols(trading_client, api_key: str, secret_key: str) -> list[str]:
     scope = hashlib.sha256(f"{api_key}:{secret_key}".encode()).hexdigest()
-    return _cached_fractional_asset_symbols(trading_client, scope)
+    _, fractional = _cached_active_equity_symbols(trading_client, scope)
+    return fractional
 
 
 NO_KEYS_MESSAGE = (
@@ -1394,11 +1415,13 @@ def main() -> None:
     client, connect_error = connect_alpaca()
     equity, positions, account_error = load_account(client)
     available_symbols: list[str] = []
+    fractional_symbols: list[str] = []
     if client is not None:
         key, secret, _ = _live_credentials()
         if key and secret:
             try:
-                available_symbols = get_fractional_asset_symbols(client, key, secret)
+                available_symbols = get_tradable_equity_symbols(client, key, secret)
+                fractional_symbols = get_fractional_asset_symbols(client, key, secret)
             except Exception as exc:
                 st.error(f"Impossibile caricare gli asset Alpaca: {exc}")
             tracked_symbols = set(positions)
@@ -1420,7 +1443,7 @@ def main() -> None:
     render_header(client, account_error or connect_error, equity, positions)
 
     selected_defaults, missing_required = prepare_ticker_selection(
-        available_symbols,
+        fractional_symbols,
         st.session_state.get("selected_tickers"),
         positions,
         st.session_state["bot_enabled"],

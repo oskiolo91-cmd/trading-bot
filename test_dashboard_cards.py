@@ -54,6 +54,7 @@ def test_asset_filter_keeps_only_active_tradable_fractional_equities():
                         fractionable=True, asset_class="crypto"),
     ]
 
+    assert dashboard.filter_tradable_equity_assets(assets) == ["SPY", "WHOLE"]
     assert dashboard.filter_fractional_assets(assets) == ["SPY"]
 
 
@@ -65,22 +66,28 @@ def test_fractional_asset_fetch_is_cached_once_per_account():
         def get_all_assets(self, filter):
             self.calls += 1
             self.asset_filter = filter
-            return [SimpleNamespace(
-                symbol="QQQ", status=AssetStatus.ACTIVE, tradable=True,
-                fractionable=True, asset_class=AssetClass.US_EQUITY,
-            )]
+            return [
+                SimpleNamespace(
+                    symbol="QQQ", status=AssetStatus.ACTIVE, tradable=True,
+                    fractionable=True, asset_class=AssetClass.US_EQUITY,
+                ),
+                SimpleNamespace(
+                    symbol="WHOLE", status=AssetStatus.ACTIVE, tradable=True,
+                    fractionable=False, asset_class=AssetClass.US_EQUITY,
+                ),
+            ]
 
     client = FakeClient()
     scope = str(uuid4())
 
-    first = dashboard._cached_fractional_asset_symbols(client, scope)
-    second = dashboard._cached_fractional_asset_symbols(client, scope)
+    first = dashboard._cached_active_equity_symbols(client, scope)
+    second = dashboard._cached_active_equity_symbols(client, scope)
 
-    assert first == second == ["QQQ"]
+    assert first == second == (["QQQ", "WHOLE"], ["QQQ"])
     assert client.calls == 1
     assert client.asset_filter.status == AssetStatus.ACTIVE
     assert client.asset_filter.asset_class == AssetClass.US_EQUITY
-    assert client.asset_filter.attributes == "fractionable"
+    assert client.asset_filter.attributes is None
 
 
 def test_selection_defaults_and_keeps_active_bot_and_positions_selected():
