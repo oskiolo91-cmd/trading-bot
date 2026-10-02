@@ -1197,8 +1197,10 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     search_query = search_col.text_input("Cerca nel radar", key="radar_search")
     radar_path = BOT_DIR / "market_radar.csv"
     if not radar_path.exists():
-        if not available_symbols or trading_client is None:
-            st.info("Ricerca non ancora generata. Serve una connessione Alpaca per caricare gli asset disponibili.")
+        if trading_client is None:
+            st.info("Connessione Alpaca non disponibile. Configura ALPACA_API_KEY e ALPACA_SECRET_KEY nei Secrets dell'app.")
+        elif not available_symbols:
+            st.info("Connessione Alpaca attiva, ma non risultano asset USA attivi, tradabili e frazionabili.")
         else:
             st.info(f"Ricerca non ancora generata. Genera i dati per {len(available_symbols)} asset Alpaca.")
             if st.button("Genera tabella di ricerca", key="generate_market_radar"):
@@ -1251,41 +1253,8 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     descending = filter_controls[3].toggle("Decrescente", key="radar_sort_desc", value=sort_by != "Symbol")
     page_size = filter_controls[4].selectbox("Righe", [10, 25, 50, 100], index=1, key="radar_page_size")
 
-    numeric_filter_specs = [
-        ("MarketCap", "Capitalizzazione", "$%.0f"),
-        ("Close", "Prezzo", "$%.2f"),
-        ("Volume_SMA20", "Volume medio", "%.0f"),
-        ("ADX", "ADX", "%.2f"),
-        ("ATR_pct", "ATR %", "%.2f"),
-        ("RSI", "RSI", "%.2f"),
-        ("BB_lower", "Bollinger inferiore", "$%.2f"),
-        ("SMA_200", "Media mobile 200", "$%.2f"),
-    ]
-    numeric_ranges = {}
-    with st.expander("Filtri numerici", expanded=False):
-        for index in range(0, len(numeric_filter_specs), 2):
-            filter_groups = st.columns(2)
-            for group, (column, label, value_format) in zip(
-                filter_groups, numeric_filter_specs[index:index + 2]
-            ):
-                values = pd.to_numeric(radar[column], errors="coerce").dropna()
-                if values.empty or values.min() == values.max():
-                    continue
-                with group:
-                    st.caption(label)
-                    selected_range = st.slider(
-                        label,
-                        min_value=float(values.min()),
-                        max_value=float(values.max()),
-                        value=(float(values.min()), float(values.max())),
-                        format=value_format,
-                        key=f"radar_range_{column}",
-                        label_visibility="collapsed",
-                    )
-                    numeric_ranges[column] = selected_range
-
     filtered = filter_market_radar(
-        radar, selected_sectors, selected_types, scalper_only, trend_only, numeric_ranges
+        radar, selected_sectors, selected_types, scalper_only, trend_only
     )
     if search_query.strip():
         filtered = filtered[filtered["Symbol"].astype(str).str.contains(search_query.strip(), case=False, regex=False)]
@@ -1360,7 +1329,6 @@ def filter_market_radar(
     quote_types: list[str],
     scalper_only: bool = False,
     trend_only: bool = False,
-    numeric_ranges: dict[str, tuple[float | None, float | None]] | None = None,
 ) -> pd.DataFrame:
     filtered = radar[
         radar["Sector"].astype(str).isin(sectors)
@@ -1372,16 +1340,6 @@ def filter_market_radar(
         filtered = filtered[filtered["Validatore_Scalper"]]
     if trend_only:
         filtered = filtered[filtered["Validatore_Trend"]]
-    for column, (minimum, maximum) in (numeric_ranges or {}).items():
-        if column not in filtered:
-            continue
-        values = pd.to_numeric(filtered[column], errors="coerce")
-        matches = values.notna()
-        if minimum is not None:
-            matches &= values >= minimum
-        if maximum is not None:
-            matches &= values <= maximum
-        filtered = filtered[matches]
     return filtered
 
 
