@@ -19,7 +19,7 @@ class ExitReason(str, Enum):
 
 @dataclass(frozen=True)
 class Order:
-    """A resting buy limit order, including split size for the live scale-out."""
+    """A resting buy limit order, including optional scale-out quantities."""
 
     created_date: pd.Timestamp
     limit_price: float

@@ -19,6 +19,7 @@ def test_fractional_partial_fills_use_fifo_and_include_commissions():
 
     assert state.position_qty == Decimal("0.00")
     assert state.daily_realized_pnl(now) == Decimal("7.28")
+    assert state.realized_pnl == Decimal("7.28")
 
 
 def test_carried_position_realizes_today_with_original_entry_commission():
@@ -101,3 +102,31 @@ def test_historical_fill_parser_accepts_minimal_alpaca_activity_payload():
     assert fills[0].symbol == "SPY"
     assert fills[0].qty == 0.25
     assert fills[0].price == 100.0
+
+
+def test_account_realized_pnl_is_reconstructed_from_closed_fill_activities():
+    import live_trader
+
+    symbol = "PNLTEST"
+    client = SimpleNamespace(get=lambda path, query: [
+        {
+            "id": "pnl-buy",
+            "symbol": symbol,
+            "side": "buy",
+            "qty": "1",
+            "price": "100",
+            "transaction_time": "2026-09-29T15:00:00Z",
+        },
+        {
+            "id": "pnl-sell",
+            "symbol": symbol,
+            "side": "sell",
+            "qty": "1",
+            "price": "110",
+            "transaction_time": "2026-09-29T16:00:00Z",
+        },
+    ])
+    live_trader._ACTIVITY_CACHE.pop(id(client), None)
+    live_trader._SYMBOL_STATES.pop(symbol, None)
+
+    assert live_trader.get_total_realized_pnl(client) == pytest.approx(9.79)

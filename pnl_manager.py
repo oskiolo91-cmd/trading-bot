@@ -47,6 +47,7 @@ class SymbolState:
         self.timezone = timezone_
         self._lots: deque[_Lot] = deque()
         self._daily_realized: dict[datetime.date, Decimal] = {}
+        self._realized_total = Decimal("0.00")
         self._execution_ids: set[str] = set()
         self._lock = RLock()
 
@@ -63,6 +64,12 @@ class SymbolState:
                 return None
             cost = sum((lot.quantity * lot.price for lot in self._lots), Decimal("0"))
             return cost / quantity
+
+    @property
+    def realized_pnl(self) -> Decimal:
+        """Net realized P&L across all replayed fills."""
+        with self._lock:
+            return _money(self._realized_total)
 
     def daily_realized_pnl(self, now: datetime | None = None) -> Decimal:
         current = now or datetime.now(self.timezone)
@@ -107,6 +114,7 @@ class SymbolState:
                 if quantity > self.position_qty:
                     raise ValueError(f"sell fill exceeds the tracked {self.symbol} position")
                 realized = self._apply_sell(quantity, fill_price, fee)
+                self._realized_total += realized
                 self._daily_realized[fill_day] = self._daily_realized.get(
                     fill_day, Decimal("0.00")
                 ) + realized

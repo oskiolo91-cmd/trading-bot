@@ -18,15 +18,14 @@ from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
 from alpaca.trading.models import TradeUpdate
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
     ReplaceOrderRequest,
-    StopLossRequest,
-    TakeProfitRequest,
+    TrailingStopOrderRequest,
 )
 from alpaca.trading.stream import TradingStream
 import pandas as pd
@@ -36,9 +35,13 @@ if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 from backtest import download_daily_bars, prepare_data
-from models import ExitDecision, ExitReason, Order, Position, StrategyParams, strategy_params_for_mode
+from bot_state import (
+    get_symbol_state as get_persisted_symbol_state,
+    update_symbol_state as update_persisted_symbol_state,
+)
+from models import Order, Position, StrategyParams, strategy_params_for_mode
 from pnl_manager import SymbolState
-from signals import entry_limit_price, evaluate_exit, stop_loss_price
+from signals import entry_limit_price, stop_loss_price
 
 EASTERN = ZoneInfo("America/New_York")
 LOG = logging.getLogger(__name__)
@@ -61,6 +64,8 @@ _TRADE_STREAM: TradingStream | None = None
 _TRADE_STREAM_THREAD: Thread | None = None
 _TRADE_STREAM_LOCK = RLock()
 _TRADE_UPDATE_HANDLERS: dict[str, list[Callable[[TradeUpdate, SymbolState], Awaitable[None]]]] = {}
+_TRAILING_FILL_LOCK = RLock()
+_TRAILING_FILL_EXECUTIONS: set[str] = set()
 
 
 def get_alpaca_client() -> TradingClient:
@@ -190,6 +195,15 @@ def get_symbol_state(
         return state
 
 
+def get_total_realized_pnl(client: TradingClient, commission_pct: float = 0.001) -> float:
+    """Replay fills through the FIFO ledgers and return account-wide realized P&L."""
+    symbols = {activity.symbol for activity in _get_trade_activities(client)}
+    return sum(
+        float(get_symbol_state(client, symbol, commission_pct).realized_pnl)
+        for symbol in symbols
+    )
+
+
 def apply_trade_update(
     client: TradingClient,
     update: TradeUpdate,
@@ -282,32 +296,146 @@ def place_limit_buy(
     symbol: str,
     limit_price: float,
     qty: float,
-    stop_loss_price: float,
-    take_profit_price: float = None,
 ) -> str:
-    if not (math.isfinite(limit_price) and math.isfinite(stop_loss_price) and math.isfinite(qty)) or not (0 < stop_loss_price < limit_price) or qty <= 0:
-        raise ValueError("Invalid buy order price, stop or share count")
+    if not (math.isfinite(limit_price) and math.isfinite(qty)) or limit_price <= 0 or qty <= 0:
+        raise ValueError("Invalid buy order price or share count")
+    if not math.isclose(qty, round(qty), abs_tol=1e-9):
+        raise ValueError("Native Alpaca trailing stops require whole-share entry quantities")
     limit = round(limit_price, 2)
-    stop = round(stop_loss_price, 2)
-    if not 0 < stop < limit:
-        raise ValueError("Stop must be below the rounded limit price")
+    request = LimitOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        limit_price=limit,
+    )
+    order = client.submit_order(order_data=request)
+    if not getattr(order, "id", None):
+        raise RuntimeError("Alpaca accepted no identifiable buy order")
+    return str(order.id)
 
-    if take_profit_price is not None:
-        if not math.isfinite(take_profit_price) or take_profit_price <= limit:
-            raise ValueError("Invalid take profit price")
-        request = LimitOrderRequest(
-            symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
-            limit_price=limit, order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
-            stop_loss=StopLossRequest(stop_price=stop),
+
+def _trailing_stop_orders(client: TradingClient, symbol: str) -> list:
+    return [
+        order for order in _open_orders(client, symbol)
+        if order.symbol == symbol
+        and order.side == OrderSide.SELL
+        and str(getattr(getattr(order, "type", None), "value", getattr(order, "type", ""))).lower()
+        == OrderType.TRAILING_STOP.value
+    ]
+
+
+def replace_trailing_stop_percent(client: TradingClient, symbol: str, trailing_pct: float) -> int:
+    """Update every open native trailing order; Alpaca's `trail` is in percentage points."""
+    if not math.isfinite(trailing_pct) or not 0 < trailing_pct < 1:
+        raise ValueError("Trailing percentage must be between 0 and 1")
+    trail_percent = round(trailing_pct * 100, 2)
+    orders = _trailing_stop_orders(client, symbol)
+    for order in orders:
+        client.replace_order_by_id(order.id, ReplaceOrderRequest(trail=trail_percent))
+    return len(orders)
+
+
+def ensure_native_trailing_stop(
+    client: TradingClient,
+    symbol: str,
+    trailing_pct: float,
+    target_qty: float | None = None,
+) -> str | None:
+    """Cover an open long position with a broker-managed trailing stop."""
+    if not math.isfinite(trailing_pct) or not 0 < trailing_pct < 1:
+        raise ValueError("Trailing percentage must be between 0 and 1")
+    position = get_open_position(client, symbol)
+    if target_qty is None:
+        if position is None:
+            return None
+        target_qty = abs(float(position.qty))
+    if not math.isfinite(target_qty) or target_qty <= 0:
+        return None
+    if not math.isclose(target_qty, round(target_qty), abs_tol=1e-9):
+        raise ValueError(
+            f"Alpaca trailing stops do not support fractional shares; {symbol} remains unchanged"
         )
-    else:
-        request = LimitOrderRequest(
-            symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
-            limit_price=limit, order_class=OrderClass.OTO,
-            take_profit=None, stop_loss=StopLossRequest(stop_price=stop),
+
+    open_orders = _open_orders(client, symbol)
+    trailing_orders = [
+        order for order in open_orders
+        if order.symbol == symbol
+        and order.side == OrderSide.SELL
+        and str(getattr(getattr(order, "type", None), "value", getattr(order, "type", ""))).lower()
+        == OrderType.TRAILING_STOP.value
+    ]
+    covered_qty = sum(
+        max(
+            0.0,
+            float(getattr(order, "qty", 0) or 0)
+            - float(getattr(order, "filled_qty", 0) or 0),
         )
-    return str(client.submit_order(order_data=request).id)
+        for order in trailing_orders
+    )
+    trail_percent = round(trailing_pct * 100, 2)
+    for order in trailing_orders:
+        current_trail = getattr(order, "trail_percent", None)
+        if current_trail is not None and not math.isclose(float(current_trail), trail_percent):
+            client.replace_order_by_id(order.id, ReplaceOrderRequest(trail=trail_percent))
+    remaining_qty = round(target_qty - covered_qty, 8)
+    if remaining_qty <= 0:
+        return str(trailing_orders[0].id) if trailing_orders else None
+
+    legacy_sell_orders = [
+        order for order in open_orders
+        if order.symbol == symbol
+        and order.side == OrderSide.SELL
+        and str(getattr(getattr(order, "type", None), "value", getattr(order, "type", ""))).lower()
+        != OrderType.TRAILING_STOP.value
+    ]
+    if legacy_sell_orders:
+        raise RuntimeError(
+            f"Legacy sell protection for {symbol} was left untouched; reconcile it before adding a trailing stop"
+        )
+
+    request = TrailingStopOrderRequest(
+        symbol=symbol,
+        qty=remaining_qty,
+        side=OrderSide.SELL,
+        type=OrderType.TRAILING_STOP,
+        time_in_force=TimeInForce.GTC,
+        trail_percent=round(trailing_pct * 100, 2),
+    )
+    order = client.submit_order(order_data=request)
+    if not getattr(order, "id", None):
+        raise RuntimeError("Alpaca accepted no identifiable trailing-stop order")
+    return str(order.id)
+
+
+async def attach_trailing_stop_on_fill(
+    client: TradingClient,
+    update: TradeUpdate,
+    trailing_pct: float,
+) -> None:
+    """Attach native protection once per buy execution, including partial fills."""
+    event = str(getattr(update.event, "value", update.event)).lower()
+    if update.order.side != OrderSide.BUY or event not in {"fill", "partial_fill"}:
+        return
+    execution_id = str(
+        update.execution_id
+        or f"{update.order.id}:{update.order.filled_qty}:{update.timestamp.isoformat()}"
+    )
+    with _TRAILING_FILL_LOCK:
+        if execution_id in _TRAILING_FILL_EXECUTIONS:
+            return
+        _TRAILING_FILL_EXECUTIONS.add(execution_id)
+    try:
+        await asyncio.to_thread(
+            ensure_native_trailing_stop,
+            client,
+            update.order.symbol,
+            trailing_pct,
+        )
+    except Exception:
+        with _TRAILING_FILL_LOCK:
+            _TRAILING_FILL_EXECUTIONS.discard(execution_id)
+        raise
 
 
 def place_market_sell(client: TradingClient, symbol: str, qty: float) -> str:
@@ -315,6 +443,13 @@ def place_market_sell(client: TradingClient, symbol: str, qty: float) -> str:
         raise ValueError("Quantity must be positive")
     request = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
     return str(client.submit_order(order_data=request).id)
+
+
+def whole_share_quantity(budget: float, price: float) -> int:
+    """Size buys to whole shares because Alpaca trailing-stop orders cannot protect fractions."""
+    if not math.isfinite(budget) or not math.isfinite(price) or budget <= 0 or price <= 0:
+        return 0
+    return math.floor(budget / price)
 
 
 def get_latest_bars(symbol: str, n: int = 60) -> pd.DataFrame:
@@ -349,16 +484,14 @@ def run_signal_check(symbol: str = "SPY", params: StrategyParams | None = None) 
     if limit is None or not math.isfinite(row["ATR"]):
         return None
     stop = stop_loss_price(limit, row["ATR"], params.stop_loss_atr_mult)
-    fractional_qty = round(params.trade_budget_usd / limit, 4)
+    fractional_qty = whole_share_quantity(params.trade_budget_usd, limit)
+    if fractional_qty < 1:
+        return None
     take_profit = limit + (float(row["ATR"]) * params.take_profit_atr_mult)
     if fractional_qty <= 0 or not (0 < round(stop, 2) < round(limit, 2)):
         return None
-    if params.bot_mode == "TREND_FOLLOWER":
-        shares_1 = round(fractional_qty / 2, 4)
-        shares_2 = shares_1
-    else:
-        shares_1 = fractional_qty
-        shares_2 = None
+    shares_1 = fractional_qty
+    shares_2 = None
     return Order(
         created_date=finished.index[-1],
         limit_price=float(limit),
@@ -409,12 +542,42 @@ def _open_orders(client: TradingClient, symbol: str) -> list:
     return result
 
 
-def _initial_position(client: TradingClient, symbol: str) -> Position | None:
+def recover_high_water_mark(symbol: str, entry_date, entry_price: float) -> float:
+    """Rebuild a missing local HWM from Alpaca daily highs since the position entry."""
+    entry_timestamp = pd.Timestamp(entry_date)
+    now = pd.Timestamp.now(tz="UTC")
+    days = max(2, (now.date() - entry_timestamp.date()).days + 2)
+    try:
+        bars = download_daily_bars(symbol, lookback_days=days)
+        if bars.empty:
+            raise ValueError(f"No historical price bars returned for {symbol}")
+        bar_dates = pd.DatetimeIndex(bars.index)
+        entry_utc = entry_timestamp.tz_localize("UTC") if entry_timestamp.tzinfo is None else entry_timestamp.tz_convert("UTC")
+        highs = pd.to_numeric(bars.loc[bar_dates >= entry_utc, "High"], errors="coerce").dropna()
+        peak = float(highs.max()) if not highs.empty else float(entry_price)
+        return max(float(entry_price), peak)
+    except Exception:
+        LOG.exception("Could not recover high-water mark for %s; using average entry price", symbol)
+        return float(entry_price)
+
+
+def _initial_position(
+    client: TradingClient,
+    symbol: str,
+    high_water_mark: float | None = None,
+) -> Position | None:
     position = get_open_position(client, symbol)
     if position is None or float(position.qty) <= 0:
         return None
-    stops = [order for order in _open_orders(client, symbol)
-             if order.side == OrderSide.SELL and getattr(order, "stop_price", None)]
+    stops = [
+        order for order in _open_orders(client, symbol)
+        if order.side == OrderSide.SELL
+        and (
+            getattr(order, "stop_price", None) is not None
+            or str(getattr(getattr(order, "type", None), "value", getattr(order, "type", ""))).lower()
+            == OrderType.TRAILING_STOP.value
+        )
+    ]
     if not stops:
         LOG.warning("No protective stop found for %s; skipping unmanaged position", symbol)
         return None
@@ -422,89 +585,32 @@ def _initial_position(client: TradingClient, symbol: str) -> Position | None:
     filled = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100, nested=False, symbols=[symbol]))
     buys = [order for order in filled if order.symbol == symbol and order.side == OrderSide.BUY and getattr(order, "filled_at", None)]
     entry_date = pd.Timestamp(max(buys, key=lambda order: order.filled_at).filled_at) if buys else pd.Timestamp.now(tz=EASTERN)
-    return Position(entry_date=entry_date, entry_price=price, stop_loss=float(stops[0].stop_price),
-                    shares=float(position.qty), entry_commission=0.0, peak_price=price)
-
-
-def _runner_stop_order(client: TradingClient, symbol: str, runner_order_id: str | None):
-    """Find the protective stop attached to the OTO runner, never the bracket tranche."""
-    orders = _open_orders(client, symbol)
-    runner_ids = {str(runner_order_id)} if runner_order_id else set()
-    runner_stop_ids = set()
-    for order in orders:
-        order_class = getattr(order, "order_class", None)
-        order_class = getattr(order_class, "value", order_class)
-        if str(order_class).lower() == OrderClass.OTO.value:
-            runner_ids.add(str(order.id))
-            for leg in getattr(order, "legs", None) or []:
-                if leg.side == OrderSide.SELL and getattr(leg, "stop_price", None) is not None:
-                    runner_stop_ids.add(str(leg.id))
-    for order in orders:
-        if order.side != OrderSide.SELL or getattr(order, "stop_price", None) is None:
-            continue
-        parent_id = getattr(order, "parent_order_id", None)
-        if str(order.id) in runner_stop_ids or (parent_id is not None and str(parent_id) in runner_ids):
-            return order
-    return None
+    try:
+        saved_peak = float(high_water_mark)
+    except (TypeError, ValueError):
+        saved_peak = float("nan")
+    peak_price = (
+        max(price, saved_peak)
+        if math.isfinite(saved_peak) and saved_peak > 0
+        else recover_high_water_mark(symbol, entry_date, price)
+    )
+    broker_stop = getattr(stops[0], "stop_price", None)
+    return Position(entry_date=entry_date, entry_price=price, stop_loss=float(broker_stop or price),
+                    shares=float(position.qty), entry_commission=0.0, peak_price=peak_price)
 
 
 def _check_exit_once(client, symbol, position_state, params):
     if not has_open_position(client, symbol):
-        position_state.clear(); return None
-    if position_state.get("pending_exit"):
-        status = client.get_order_by_id(position_state["pending_exit"]).status
-        if str(getattr(status, "value", status)) not in {"canceled", "rejected", "expired"}:
-            return None
-        position_state.pop("pending_exit", None)
-    bars = get_latest_bars(symbol)
-    data = prepare_data(bars)
-    if data.empty: return None
-    current = data.iloc[-1]
-    day = pd.Timestamp(data.index[-1]).date()
-    today = datetime.now(EASTERN).date()
-    if day != today or not math.isfinite(float(current["BB_mid"])): return None
-    if day != position_state.get("day"):
-        position_state["day"] = day
-        position_state["base"] = position_state["position"]
-    base = position_state["base"]
-    updated, decision = evaluate_exit(
-        base, float(current["Open"]), float(current["High"]), float(current["Low"]),
-        float(current["Close"]), float(current["BB_mid"]), params.trailing_pct, params.time_stop,
+        position_state.clear()
+        return None
+    position = get_open_position(client, symbol)
+    ensure_native_trailing_stop(
+        client,
+        symbol,
+        params.trailing_pct,
+        abs(float(position.qty)) if position is not None else None,
     )
-    if decision is None:
-        # Move only the runner's Alpaca stop: first to break-even, then upward with ATR.
-        initial_stop = position_state.setdefault("initial_stop", float(base.stop_loss))
-        stop_order = _runner_stop_order(client, symbol, position_state.get("runner_order_id"))
-        if stop_order is not None and math.isfinite(float(current["ATR"])):
-            entry_price = float(base.entry_price)
-            current_price = float(current["Close"])
-            current_stop = float(stop_order.stop_price)
-            next_stop = current_stop
-            break_even_trigger = entry_price + (entry_price - initial_stop)
-            if current_price >= break_even_trigger:
-                next_stop = max(next_stop, entry_price)
-                atr_stop = current_price - (float(current["ATR"]) * params.stop_loss_atr_mult)
-                next_stop = max(next_stop, atr_stop)
-            rounded_stop = round(next_stop, 2)
-            if rounded_stop > current_stop and rounded_stop < current_price:
-                client.replace_order_by_id(
-                    stop_order.id,
-                    ReplaceOrderRequest(stop_price=rounded_stop),
-                )
-                updated = replace(updated, stop_loss=rounded_stop)
-                position_state["base"] = updated
-        position_state["position"] = updated; return None
-    if decision.reason is ExitReason.STOP_LOSS: return decision
-    for order in _open_orders(client, symbol):
-        if order.symbol == symbol and order.side == OrderSide.SELL:
-            client.cancel_order_by_id(order.id)
-    if any(o.symbol == symbol and o.side == OrderSide.SELL for o in _open_orders(client, symbol)): return None
-    pos = get_open_position(client, symbol)
-    if pos is None: position_state.clear(); return None
-    sell_id = place_market_sell(client, symbol, float(pos.qty))
-    position_state["pending_exit"] = sell_id
-    position_state["position"] = updated
-    return decision
+    return None
 
 
 class LiveTradingEngine:
@@ -513,6 +619,15 @@ class LiveTradingEngine:
     def __init__(self, symbol: str, params: StrategyParams, client: TradingClient | None = None) -> None:
         self.symbol = symbol
         self.params = params
+        persisted = get_persisted_symbol_state(symbol)
+        stored_trail = persisted.get("trailing_pct")
+        if stored_trail is not None:
+            try:
+                stored_trail = float(stored_trail)
+            except (TypeError, ValueError):
+                stored_trail = float("nan")
+            if math.isfinite(stored_trail) and 0 < stored_trail < 1:
+                self.params = replace(params, trailing_pct=stored_trail)
         self.client = client or get_alpaca_client()
         self.api_key = os.environ["ALPACA_API_KEY"]
         self.secret_key = os.environ["ALPACA_SECRET_KEY"]
@@ -527,7 +642,12 @@ class LiveTradingEngine:
             if order.symbol == self.symbol and order.side == OrderSide.BUY
         }
         self.halted_day = None
-        self.last_entry_day = None
+        saved_buy_date = persisted.get("last_buy_date")
+        try:
+            self.last_entry_day = datetime.fromisoformat(saved_buy_date).date() if saved_buy_date else None
+        except (TypeError, ValueError):
+            LOG.warning("Ignoring invalid persisted last-buy date for %s", symbol)
+            self.last_entry_day = None
         self.clock = None
         self._event_lock = asyncio.Lock()
 
@@ -566,6 +686,7 @@ class LiveTradingEngine:
         async with self._event_lock:
             try:
                 self._update_pending_entry_orders(update)
+                await attach_trailing_stop_on_fill(self.client, update, self.params.trailing_pct)
                 if state is self.symbol_state:
                     await self._enforce_daily_limits(update.timestamp)
             except Exception:
@@ -608,9 +729,28 @@ class LiveTradingEngine:
         has_position = self.symbol_state.position_qty > 0
         if has_position:
             if "position" not in self.position_state:
-                position = await asyncio.to_thread(_initial_position, self.client, self.symbol)
+                open_position = await asyncio.to_thread(get_open_position, self.client, self.symbol)
+                if open_position is not None:
+                    await asyncio.to_thread(
+                        ensure_native_trailing_stop,
+                        self.client,
+                        self.symbol,
+                        self.params.trailing_pct,
+                        abs(float(open_position.qty)),
+                    )
+                persisted = get_persisted_symbol_state(self.symbol)
+                position = await asyncio.to_thread(
+                    _initial_position,
+                    self.client,
+                    self.symbol,
+                    persisted.get("high_water_mark"),
+                )
                 if position is not None:
                     self.position_state["position"] = position
+                    update_persisted_symbol_state(
+                        self.symbol,
+                        {"high_water_mark": float(position.peak_price), "trailing_pct": self.params.trailing_pct},
+                    )
             if "position" in self.position_state:
                 self.position_state["runner_order_id"] = self.runner_order_id
                 decision = await asyncio.to_thread(
@@ -632,9 +772,8 @@ class LiveTradingEngine:
             self.symbol,
             order.limit_price,
             order.shares_1 or order.shares,
-            order.stop_loss,
-            order.take_profit_price,
         )
+        self.pending_entry_order_ids.add(bracket_id)
         runner_id = None
         if order.shares_2:
             runner_id = await asyncio.to_thread(
@@ -643,14 +782,11 @@ class LiveTradingEngine:
                 self.symbol,
                 order.limit_price,
                 order.shares_2,
-                order.stop_loss,
             )
-        self.pending_entry_order_ids.add(bracket_id)
-        if runner_id:
             self.pending_entry_order_ids.add(runner_id)
         self.runner_order_id = runner_id
         self.position_state["runner_order_id"] = runner_id
-        LOG.info("Submitted orders %s and %s for %s", bracket_id, runner_id, self.symbol)
+        LOG.info("Submitted entry orders %s and %s for %s; trailing protection follows fill", bracket_id, runner_id, self.symbol)
 
     async def _process_minute_bar(self, bar) -> None:
         async with self._event_lock:
@@ -669,6 +805,17 @@ class LiveTradingEngine:
         if clock_close is None or clock_close.astimezone(EASTERN).date() != day:
             self.clock = await asyncio.to_thread(self.client.get_clock)
         if not self.clock.is_open:
+            return
+        if self.symbol_state.position_qty > 0:
+            position = await asyncio.to_thread(get_open_position, self.client, self.symbol)
+            if position is not None:
+                await asyncio.to_thread(
+                    ensure_native_trailing_stop,
+                    self.client,
+                    self.symbol,
+                    self.params.trailing_pct,
+                    abs(float(position.qty)),
+                )
             return
         next_close = self.clock.next_close
         if next_close.tzinfo is None:
@@ -692,8 +839,15 @@ class LiveTradingEngine:
             return
         if self.pending_entry_order_ids:
             return
-        self.last_entry_day = day
-        await self._submit_signal_order()
+        try:
+            await self._submit_signal_order()
+        finally:
+            if self.pending_entry_order_ids:
+                self.last_entry_day = day
+                update_persisted_symbol_state(
+                    self.symbol,
+                    {"last_buy_date": day.isoformat(), "trailing_pct": self.params.trailing_pct},
+                )
 
 
 def run_live_loop(symbol: str | None = None, params: StrategyParams | None = None) -> None:

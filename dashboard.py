@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import hashlib
 import os
@@ -22,6 +23,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, QueryOrderStatus
 from alpaca.trading.requests import GetAssetsRequest, GetOrdersRequest, GetPortfolioHistoryRequest
+from alpaca.trading.enums import OrderType
 
 
 BOT_DIR = Path(__file__).resolve().parent
@@ -47,12 +49,14 @@ def resolve_market_radar_path(output_path: str | Path | None = None) -> Path:
 from backtest import BacktestResult, download_daily_bars, prepare_data, run_backtest
 from alpaca_data import fetch_daily_bars
 from models import Position, StrategyParams
-from signals import trailing_stop_price
+from bot_state import get_symbol_state as get_persisted_symbol_state, load_bot_state, update_symbol_state
 from live_trader import (
-    _check_exit_once, _initial_position, _open_orders, close_symbol_position,
-    get_account_value, get_alpaca_client, get_symbol_daily_pnl,
+    _initial_position, _open_orders, _trailing_stop_orders,
+    attach_trailing_stop_on_fill, close_symbol_position, ensure_native_trailing_stop,
+    get_account_value, get_alpaca_client, get_symbol_daily_pnl, get_total_realized_pnl,
     get_latest_bars, get_recent_orders, place_limit_buy, place_market_sell,
-    run_signal_check, start_trade_update_stream,
+    register_trade_update_handler, replace_trailing_stop_percent, run_signal_check,
+    start_trade_update_stream, whole_share_quantity,
 )
 
 DEFAULT_SYMBOLS = ("SPY", "QQQ")
@@ -73,6 +77,8 @@ DEFAULT_PROFILE = "⚖️ Bilanciato"
 CUSTOM_PROFILE = "🎛️ Custom"
 BACKTEST_PERIOD = "90d"
 EASTERN = ZoneInfo("America/New_York")
+_ACTIVE_TRADING_CLIENT = None
+_REGISTERED_TRAILING_SYMBOLS: set[str] = set()
 
 
 @st.cache_resource
@@ -208,6 +214,45 @@ def get_ticker_params(symbol: str, state=None) -> StrategyParams:
     if trailing_override is not None:
         params = replace(params, trailing_pct=float(trailing_override))
     return params
+
+
+def persist_symbol_settings(state: dict, symbol: str) -> None:
+    """Persist the currently selected profile, custom risk values, HWM, and daily entry guard."""
+    params = get_ticker_params(symbol, state)
+    custom_keys = (
+        "custom_adx", "custom_rsi", "custom_budget", "custom_stop_atr",
+        "custom_take_profit_atr", "custom_trailing_pct", "custom_daily_target",
+        "custom_max_drawdown",
+    )
+    custom_settings = {
+        key: float(state[f"{key}_{symbol}"])
+        for key in custom_keys
+        if f"{key}_{symbol}" in state
+    }
+    record = {
+        "profile": state.get("profile", {}).get(symbol, DEFAULT_PROFILE),
+        "trailing_pct": float(params.trailing_pct),
+        "custom_trailing_pct": state.get("trailing_stop_pct", {}).get(symbol),
+        "custom_settings": custom_settings,
+    }
+    symbol_state = state.get("bot_state", {}).get(symbol, {})
+    managed_position = symbol_state.get("position", symbol_state.get("base"))
+    if isinstance(managed_position, Position):
+        record["high_water_mark"] = float(managed_position.peak_price)
+    last_buy = state.get("bot_last_buy", {}).get(symbol)
+    if last_buy is not None:
+        record["last_buy_date"] = last_buy.isoformat() if hasattr(last_buy, "isoformat") else str(last_buy)
+    update_symbol_state(symbol, record)
+
+
+async def _attach_dashboard_trailing_stop(update, _symbol_state) -> None:
+    client = _ACTIVE_TRADING_CLIENT
+    if client is None:
+        raise RuntimeError("Alpaca client is unavailable while handling a buy fill")
+    symbol = update.order.symbol
+    persisted = get_persisted_symbol_state(_display_symbol(symbol))
+    trailing_pct = persisted.get("trailing_pct", PROFILES[DEFAULT_PROFILE].trailing_pct)
+    await attach_trailing_stop_on_fill(client, update, float(trailing_pct))
 
 
 def run_profile_backtest(symbol: str) -> dict[str, BacktestResult]:
@@ -469,7 +514,7 @@ def render_symbol_card(client, equity: float | None, symbol: str, positions: dic
             PROFILE_NAMES,
             key=f"profile_{symbol}",
             on_change=_on_profile_change,
-            args=(symbol,),
+            args=(symbol, client),
         )
         profile_controls[1].toggle(
             "Bot",
@@ -480,43 +525,34 @@ def render_symbol_card(client, equity: float | None, symbol: str, positions: dic
         )
 
         default_limit = max(0.01, float(data.get("bb_lower", price or 0.01)))
-        default_stop = max(
-            0.01,
-            float(data.get("bb_lower", price or 0.01) - params.stop_loss_atr_mult * data.get("atr", 0.0)),
-        )
         has_quote = all(
             isinstance(data.get(key), (int, float)) and math.isfinite(data[key])
             for key in ("price", "atr", "bb_lower")
         )
         if has_quote and not st.session_state.get(f"buy_defaults_loaded_{symbol}"):
             st.session_state[f"buy_limit_{symbol}"] = default_limit
-            st.session_state[f"buy_stop_{symbol}"] = min(default_stop, default_limit - 0.01)
             st.session_state[f"buy_defaults_loaded_{symbol}"] = True
         st.session_state.setdefault(f"buy_limit_{symbol}", 0.01)
-        st.session_state.setdefault(f"buy_stop_{symbol}", 0.01)
         st.session_state.setdefault(f"buy_budget_{symbol}", params.trade_budget_usd)
         st.session_state.setdefault(f"buy_confirm_{symbol}", False)
-        order_controls = st.columns([1, 1, 1, 1, 1], vertical_alignment="bottom")
+        order_controls = st.columns([1, 1, 1, 1], vertical_alignment="bottom")
         order_controls[0].number_input(
             "Budget (USD)", min_value=1.0, step=25.0, key=f"buy_budget_{symbol}"
         )
         order_controls[1].number_input(
             "Prezzo limite ($)", min_value=0.01, step=0.01, key=f"buy_limit_{symbol}"
         )
-        order_controls[2].number_input(
-            "Stop loss ($)", min_value=0.01, step=0.01, key=f"buy_stop_{symbol}"
-        )
         limit_price = st.session_state[f"buy_limit_{symbol}"]
         estimated_qty = (
-            round(st.session_state[f"buy_budget_{symbol}"] / limit_price, 4)
+            whole_share_quantity(st.session_state[f"buy_budget_{symbol}"], limit_price)
             if has_quote and limit_price > 0
             else None
         )
-        order_controls[3].caption(
+        order_controls[2].caption(
             f"Quantità: {estimated_qty:.4f} az." if estimated_qty is not None else "Quantità: in attesa dei dati"
         )
-        confirmed = order_controls[4].checkbox("Conferma", key=f"card_confirm_{symbol}")
-        order_controls[4].button(
+        confirmed = order_controls[3].checkbox("Conferma", key=f"card_confirm_{symbol}")
+        order_controls[3].button(
             "Invia ordine",
             key=f"card_buy_{symbol}",
             on_click=_on_submit_buy,
@@ -666,19 +702,57 @@ def order_plan(
     params: StrategyParams,
     entry_price_override: float | None = None,
 ) -> tuple[float, float, float]:
-    """Return a fixed-budget fractional quantity, limit, and ATR stop."""
+    """Return the entry limit, native trailing percentage, and whole-share quantity."""
     override = _number_or_nan(entry_price_override)
     entry_price = override if math.isfinite(override) and override > 0 else data["bb_lower"]
     limit = round(entry_price, 2)
-    stop = round(limit - params.stop_loss_atr_mult * data["atr"], 2)
-    quantity = round(params.trade_budget_usd / limit, 4) if limit > 0 else 0.0
-    return limit, stop, quantity
+    quantity = whole_share_quantity(params.trade_budget_usd, limit)
+    return limit, params.trailing_pct, quantity
 
 
 def add_log(state, message: str) -> None:
     log = state.setdefault("bot_log", [])
     log.append(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}")
     del log[:-LOG_LIMIT]
+
+
+def reconcile_open_position_stops(client, positions: dict, state: dict) -> None:
+    """Reconcile every account position, including manually traded symbols, with Alpaca stops."""
+    for alpaca_symbol, position in positions.items():
+        try:
+            quantity = float(getattr(position, "qty", 0))
+        except (TypeError, ValueError):
+            continue
+        if quantity <= 0:
+            continue
+        symbol = _display_symbol(alpaca_symbol)
+        persisted = get_persisted_symbol_state(symbol)
+        trailing_pct = get_ticker_params(symbol, state).trailing_pct
+        stored_trail = persisted.get("trailing_pct")
+        try:
+            stored_trail = float(stored_trail) if stored_trail is not None else None
+        except (TypeError, ValueError):
+            stored_trail = None
+        if stored_trail is not None and math.isfinite(stored_trail) and 0 < stored_trail < 1:
+            trailing_pct = stored_trail
+        try:
+            ensure_native_trailing_stop(client, alpaca_symbol, trailing_pct, quantity)
+        except Exception as exc:
+            add_log(state, f"🛡️ {symbol}: trailing stop Alpaca non riconciliato: {exc}")
+        try:
+            symbol_state = state.setdefault("bot_state", {}).setdefault(symbol, {})
+            if "position" not in symbol_state:
+                local_position = _initial_position(
+                    client,
+                    alpaca_symbol,
+                    persisted.get("high_water_mark"),
+                )
+                if local_position is not None:
+                    symbol_state["position"] = local_position
+                    state.setdefault("bot_high_water_marks", {})[symbol] = local_position.peak_price
+                    persist_symbol_settings(state, symbol)
+        except Exception as exc:
+            add_log(state, f"🛡️ {symbol}: high-water mark non recuperato: {exc}")
 
 
 def cancel_open_sells(client, alpaca_symbol: str, attempts: int = 10) -> None:
@@ -696,6 +770,8 @@ def cancel_open_sells(client, alpaca_symbol: str, attempts: int = 10) -> None:
 def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
     """One bot pass over every enabled ticker: exit checks on open positions, entries on signals."""
     enabled = [symbol for symbol, on in state.get("bot_enabled", {}).items() if on]
+    if positions:
+        reconcile_open_position_stops(client, positions, state)
     try:
         market_open = bool(client.get_clock().is_open)
     except Exception as exc:
@@ -714,6 +790,28 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
     for symbol in enabled:
         alpaca_symbol = to_alpaca_symbol(symbol)
         data = state.get("live_data", {}).get(symbol, {})
+        persisted = get_persisted_symbol_state(symbol)
+        saved_profile = persisted.get("profile")
+        if saved_profile in PROFILE_NAMES:
+            state.setdefault("profile", {})[symbol] = saved_profile
+        saved_override = persisted.get("custom_trailing_pct")
+        if saved_override is None:
+            state.get("trailing_stop_pct", {}).pop(symbol, None)
+        else:
+            try:
+                saved_override = float(saved_override)
+            except (TypeError, ValueError):
+                saved_override = float("nan")
+            if math.isfinite(saved_override) and 0 < saved_override < 1:
+                state.setdefault("trailing_stop_pct", {})[symbol] = saved_override
+        for key, value in persisted.get("custom_settings", {}).items():
+            state[f"{key}_{symbol}"] = value
+        saved_buy_date = persisted.get("last_buy_date")
+        if symbol not in last_buy and saved_buy_date:
+            try:
+                last_buy[symbol] = datetime.fromisoformat(saved_buy_date).date()
+            except (TypeError, ValueError):
+                add_log(state, f"🤖 {symbol}: data last-buy persistito non valido; lo ignoro")
         params = get_ticker_params(symbol, state)
         try:
             if daily_risk["halted_symbols"].get(symbol):
@@ -729,20 +827,30 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
             if alpaca_symbol in positions:
                 if not market_open:
                     continue
+                position = positions[alpaca_symbol]
+                ensure_native_trailing_stop(
+                    client,
+                    alpaca_symbol,
+                    params.trailing_pct,
+                    abs(float(position.qty)),
+                )
                 exit_state = bot_state.setdefault(symbol, {})
                 if runner_order_ids.get(symbol):
                     exit_state["runner_order_id"] = runner_order_ids[symbol]
                 if "position" not in exit_state:
-                    position = _initial_position(client, alpaca_symbol)
+                    position = _initial_position(
+                        client,
+                        alpaca_symbol,
+                        persisted.get("high_water_mark"),
+                    )
                     if position is None:
                         if not exit_state.get("warned"):
                             add_log(state, f"🤖 {symbol}: posizione senza stop protettivo, gestiscila a mano")
                             exit_state["warned"] = True
                         continue
                     exit_state["position"] = position
-                decision = _check_exit_once(client, alpaca_symbol, exit_state, params)
-                if decision is not None:
-                    add_log(state, f"🤖 {symbol}: uscita {decision.reason.value} a ~${decision.price:,.2f}")
+                    state.setdefault("bot_high_water_marks", {})[symbol] = position.peak_price
+                    persist_symbol_settings(state, symbol)
                 continue
             bot_state.pop(symbol, None)
             if not compute_signal(data, params) or last_buy.get(symbol) == today:
@@ -750,24 +858,15 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
             if any(order.side == OrderSide.BUY for order in _open_orders(client, alpaca_symbol)):
                 continue
             entry_override = state.get("bot_entry_price_overrides", {}).get(symbol)
-            limit, stop, shares = order_plan(data, params, entry_override)
-            last_buy[symbol] = today
-            if shares <= 0 or not 0 < stop < limit:
+            limit, trailing_pct, shares = order_plan(data, params, entry_override)
+            if shares < 1 or not 0 < trailing_pct < 1:
                 add_log(state, f"🤖 {symbol}: segnale attivo ma ordine non dimensionabile")
                 continue
-            take_profit = limit + (float(data["atr"]) * params.take_profit_atr_mult)
-            if params.bot_mode == "TREND_FOLLOWER":
-                shares_1 = round(shares / 2, 4)
-                shares_2 = shares_1
-                order_id = place_limit_buy(client, alpaca_symbol, limit, shares_1, stop, take_profit)
-                runner_id = place_limit_buy(client, alpaca_symbol, limit, shares_2, stop)
-            else:
-                shares_1, shares_2 = shares, None
-                order_id = place_limit_buy(client, alpaca_symbol, limit, shares, stop, take_profit)
-                runner_id = None
-            if runner_id:
-                runner_order_ids[symbol] = runner_id
-            add_log(state, f"🤖 {symbol}: {params.bot_mode} qty {shares_1}+{shares_2 or 0:.4f} @ ${limit:,.2f}; target ${take_profit:,.2f}, runner {runner_id or 'n/d'} (ID {order_id})")
+            order_id = place_limit_buy(client, alpaca_symbol, limit, shares)
+            last_buy[symbol] = today
+            if state is st.session_state:
+                persist_symbol_settings(state, symbol)
+            add_log(state, f"🤖 {symbol}: {params.bot_mode} qty {shares:.0f} @ ${limit:,.2f}; trailing broker {params.trailing_pct:.1%} after fill (ID {order_id})")
         except Exception as exc:
             add_log(state, f"🤖 {symbol}: errore {exc}")
 
@@ -776,7 +875,7 @@ def init_state() -> None:
     defaults = {
         "bot_enabled": {},
         "active_tickers": [],
-        "live_data": {}, "bot_log": [], "bot_state": {}, "bot_last_buy": {},
+        "live_data": {}, "bot_log": [], "bot_state": {}, "bot_last_buy": {}, "bot_high_water_marks": {},
         "panels": {}, "panel_msg": {}, "bot_notice": {}, "auto_refresh": True,
         "profile": {},
         "backtest_open": {},
@@ -785,6 +884,36 @@ def init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    if not st.session_state.get("bot_state_loaded"):
+        persisted_symbols = load_bot_state()["symbols"]
+        for symbol, record in persisted_symbols.items():
+            if not isinstance(record, dict):
+                continue
+            profile = record.get("profile")
+            if profile in PROFILE_NAMES:
+                st.session_state["profile"][symbol] = profile
+            custom_trailing = record.get("custom_trailing_pct")
+            try:
+                custom_trailing = float(custom_trailing) if custom_trailing is not None else None
+            except (TypeError, ValueError):
+                custom_trailing = None
+            if custom_trailing is not None and math.isfinite(custom_trailing) and 0 < custom_trailing < 1:
+                st.session_state.setdefault("trailing_stop_pct", {})[symbol] = custom_trailing
+            try:
+                saved_hwm = float(record.get("high_water_mark"))
+            except (TypeError, ValueError):
+                saved_hwm = float("nan")
+            if math.isfinite(saved_hwm) and saved_hwm > 0:
+                st.session_state["bot_high_water_marks"][symbol] = saved_hwm
+            for key, value in record.get("custom_settings", {}).items():
+                st.session_state[f"{key}_{symbol}"] = value
+            last_buy_date = record.get("last_buy_date")
+            if last_buy_date:
+                try:
+                    st.session_state["bot_last_buy"][symbol] = datetime.fromisoformat(last_buy_date).date()
+                except (TypeError, ValueError):
+                    add_log(st.session_state, f"🤖 {symbol}: data last-buy persistito non valido; lo ignoro")
+        st.session_state["bot_state_loaded"] = True
 
 
 def needs_refresh() -> bool:
@@ -814,9 +943,30 @@ def set_ticker_bot_enabled(state: dict, symbol: str, enabled: bool) -> None:
     state["active_tickers"] = sorted(active_tickers)
 
 
-def _on_profile_change(symbol: str) -> None:
+def _on_profile_change(symbol: str, client=None) -> None:
     name = st.session_state.get(f"profile_{symbol}", DEFAULT_PROFILE)
+    previous_name = st.session_state["profile"].get(symbol, DEFAULT_PROFILE)
+    if name != previous_name:
+        st.session_state.get("trailing_stop_pct", {}).pop(symbol, None)
     st.session_state["profile"][symbol] = name
+    persist_symbol_settings(st.session_state, symbol)
+    try:
+        has_trailing = client is not None and bool(_trailing_stop_orders(client, to_alpaca_symbol(symbol)))
+        has_position = client is not None and to_alpaca_symbol(symbol) in get_positions_map(client)
+        if client is not None and (has_trailing or has_position):
+            updated = replace_trailing_stop_percent(
+                client,
+                to_alpaca_symbol(symbol),
+                get_ticker_params(symbol).trailing_pct,
+            )
+            if not updated:
+                add_log(st.session_state, f"⚠️ {symbol}: nessun trailing stop aperto da aggiornare su Alpaca")
+    except Exception as exc:
+        st.session_state.setdefault("panel_msg", {})[symbol] = (
+            "error",
+            f"Profilo salvato ma trailing stop Alpaca non aggiornato: {exc}",
+        )
+        add_log(st.session_state, f"⚠️ {symbol}: replace del trailing Alpaca fallito: {exc}")
     add_log(st.session_state, f"⚙️ {symbol}: profilo di rischio {name}")
 
 
@@ -863,18 +1013,20 @@ def _on_select_detail(table_key: str, click_key: str) -> None:
 
 def _on_submit_buy(client, symbol: str) -> None:
     limit = float(st.session_state[f"buy_limit_{symbol}"])
-    stop = float(st.session_state[f"buy_stop_{symbol}"])
     budget = float(st.session_state[f"buy_budget_{symbol}"])
-    shares = round(budget / limit, 4) if limit > 0 else 0.0
+    shares = whole_share_quantity(budget, limit)
     try:
         if shares <= 0:
-            raise ValueError("Prezzo limite e budget devono essere positivi")
-        order_id = place_limit_buy(client, to_alpaca_symbol(symbol), limit, shares, stop)
+            raise ValueError("Budget insufficiente per almeno un'azione intera protetta dal trailing Alpaca")
+        order_id = place_limit_buy(client, to_alpaca_symbol(symbol), limit, shares)
     except Exception as exc:
         st.session_state["panel_msg"][symbol] = ("error", f"Ordine non inviato: {exc}")
         return
     st.session_state["panels"].pop(symbol, None)
-    text = f"Ordine limite inviato: ${budget:,.2f} ~ {shares:.4f} az. @ ${limit:,.2f}, stop ${stop:,.2f} (ID {order_id})"
+    text = (
+        f"Ordine limite inviato: ${budget:,.2f} ~ {shares:.0f} az. @ ${limit:,.2f}; "
+        f"trailing Alpaca {get_ticker_params(symbol).trailing_pct:.1%} dopo il fill (ID {order_id})"
+    )
     st.session_state["panel_msg"][symbol] = ("success", text)
     add_log(st.session_state, f"👤 {symbol}: {text}")
 
@@ -960,7 +1112,7 @@ def portfolio_history_chart(history: pd.DataFrame) -> go.Figure:
         hovertemplate="%{x|%d %b %Y}<br>$%{y:,.2f}<extra></extra>",
     ))
     figure.update_layout(
-        title="Andamento del capitale",
+        title="Equity del conto (include i flussi di cassa)",
         height=280,
         margin={"l": 10, "r": 20, "t": 45, "b": 10},
         hovermode="x unified",
@@ -1003,20 +1155,25 @@ def render_header(client, account_error: str | None, equity: float | None, posit
     capital_change_pct = None
     history_error = None
     try:
+        realized_pnl = get_total_realized_pnl(client)
+        unrealized_pnl = sum(
+            float(getattr(position, "unrealized_pl", 0) or 0)
+            for position in positions.values()
+        )
+        capital_change = realized_pnl + unrealized_pnl
         api_key, secret, _ = _live_credentials()
         if api_key and secret:
             credential_scope = hashlib.sha256(f"{api_key}:{secret}".encode()).hexdigest()
             history = _cached_portfolio_history(client, credential_scope)
             history_frame, base_value = build_portfolio_history_frame(history)
             if base_value is not None and base_value > 0:
-                capital_change = equity - base_value
                 capital_change_pct = capital_change / base_value * 100
     except Exception as exc:
-        history_error = f"Storico del capitale non disponibile: {exc}"
+        history_error = f"Metriche P&L non disponibili: {exc}"
 
     cols[0].metric("Account Equity", f"${equity:,.2f}")
     cols[1].metric(
-        "Variazione da inizio",
+        "P&L trading (realizzato + aperto)",
         f"${capital_change:+,.2f}" if capital_change is not None else "—",
         delta=f"{capital_change_pct:+.2f}%" if capital_change_pct is not None else None,
     )
@@ -1031,6 +1188,7 @@ def render_header(client, account_error: str | None, equity: float | None, posit
             config={"responsive": True, "displaylogo": False},
             key="account_equity_history",
         )
+        st.caption("Il grafico mostra l'equity del conto; il KPI P&L usa invece P&L realizzato + non realizzato.")
     if history_error:
         st.caption(history_error)
     if account_error:
@@ -1039,14 +1197,14 @@ def render_header(client, account_error: str | None, equity: float | None, posit
 
 def render_buy_panel(client, symbol: str) -> None:
     with st.container(border=True):
-        st.markdown(f"**Compra {symbol}** ~ ordine limite DAY con stop-loss protettivo")
-        cols = st.columns(3)
+        params = get_ticker_params(symbol)
+        st.markdown(f"**Compra {symbol}** ~ ordine limite DAY con trailing stop Alpaca {params.trailing_pct:.1%} dopo il fill")
+        cols = st.columns(2)
         cols[0].number_input("Prezzo limite ($)", min_value=0.0, step=0.01, key=f"buy_limit_{symbol}")
-        cols[1].number_input("Stop loss ($)", min_value=0.0, step=0.01, key=f"buy_stop_{symbol}")
-        budget = cols[2].number_input("Budget (USD)", min_value=1.0, step=25.0, key=f"buy_budget_{symbol}")
+        budget = cols[1].number_input("Budget (USD)", min_value=1.0, step=25.0, key=f"buy_budget_{symbol}")
         limit = float(st.session_state.get(f"buy_limit_{symbol}", 0.0))
-        estimate = round(budget / limit, 4) if limit > 0 else 0.0
-        cols[2].caption(f"Quantità stimata: {estimate:.4f} az.")
+        estimate = whole_share_quantity(budget, limit)
+        cols[1].caption(f"Quantità intera stimata: {estimate} az.")
         confirmed = st.checkbox("Confermo l'ordine", key=f"buy_confirm_{symbol}")
         st.button("Invia ordine", key=f"buy_submit_{symbol}", type="primary", disabled=not confirmed,
                   on_click=_on_submit_buy, args=(client, symbol))
@@ -1084,18 +1242,18 @@ def render_symbol_risk_status(client, symbol: str, data: dict, params: StrategyP
     if params.bot_mode == "TREND_FOLLOWER" and isinstance(price, (int, float)) and price > 0:
         stops = [
             float(order.stop_price)
-            for order in _open_orders(client, alpaca_symbol)
+            for order in _trailing_stop_orders(client, alpaca_symbol)
             if order.symbol == alpaca_symbol
-            and order.side == OrderSide.SELL
             and getattr(order, "stop_price", None) is not None
         ]
         if stops:
             stop_price = max(stops)
             distance_pct = max(0.0, (price - stop_price) / price * 100)
-            st.caption(f"Rete di sicurezza: stop ${stop_price:.2f}, distanza {distance_pct:.2f}%")
+            st.caption(f"Stop trailing broker: ${stop_price:.2f}, distanza {distance_pct:.2f}%")
 
 
 def render_custom_sliders(symbol: str) -> None:
+    previous_trailing = get_persisted_symbol_state(symbol).get("trailing_pct")
     base = PROFILES[DEFAULT_PROFILE]
     defaults = {f"custom_adx_{symbol}": float(base.adx_max), f"custom_rsi_{symbol}": float(base.rsi_max),
                 f"custom_budget_{symbol}": float(base.trade_budget_usd),
@@ -1118,6 +1276,21 @@ def render_custom_sliders(symbol: str) -> None:
         cols[5].slider("Trailing stop %", 0.01, 0.20, step=0.01, key=f"custom_trailing_pct_{symbol}")
         cols[6].number_input("Daily target $", min_value=0.1, step=1.0, key=f"custom_daily_target_{symbol}")
         cols[7].number_input("Daily loss cap $", min_value=0.1, step=1.0, key=f"custom_max_drawdown_{symbol}")
+    params = get_ticker_params(symbol)
+    persist_symbol_settings(st.session_state, symbol)
+    try:
+        previous_trailing = float(previous_trailing)
+    except (TypeError, ValueError):
+        previous_trailing = params.trailing_pct
+    if _ACTIVE_TRADING_CLIENT is not None and not math.isclose(previous_trailing, params.trailing_pct):
+        try:
+            replace_trailing_stop_percent(client=_ACTIVE_TRADING_CLIENT, symbol=to_alpaca_symbol(symbol),
+                                          trailing_pct=params.trailing_pct)
+        except Exception as exc:
+            st.session_state.setdefault("panel_msg", {})[symbol] = (
+                "error",
+                f"Impostazione custom salvata ma trailing stop Alpaca non aggiornato: {exc}",
+            )
 
 
 def backtest_chart(table: pd.DataFrame) -> go.Figure:
@@ -1178,7 +1351,7 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
         if f"profile_{symbol}" not in st.session_state:
             st.session_state[f"profile_{symbol}"] = st.session_state["profile"].get(symbol, DEFAULT_PROFILE)
         st.selectbox(f"Profilo {symbol}", PROFILE_NAMES, key=f"profile_{symbol}", label_visibility="collapsed",
-                     on_change=_on_profile_change, args=(symbol,))
+                     on_change=_on_profile_change, args=(symbol, client))
         st.toggle(f"Bot {symbol}", key=f"bot_{symbol}", disabled=not trading_ok,
                   on_change=_on_toggle, args=(symbol,))
         if st.session_state["bot_enabled"].get(symbol):
@@ -1203,11 +1376,13 @@ def render_ticker_row(symbol: str, client, equity: float | None, positions: dict
         else:
             defaults = {}
             if trading_ok and "price" in data and math.isfinite(data["atr"]) and math.isfinite(data["bb_lower"]):
-                limit, stop, shares = order_plan(data, params)
-                target = limit + (data["atr"] * params.take_profit_atr_mult)
-                defaults = {f"buy_limit_{symbol}": max(0.0, limit), f"buy_stop_{symbol}": max(0.0, stop),
-                            f"buy_budget_{symbol}": params.trade_budget_usd, f"buy_confirm_{symbol}": False}
-                st.caption(f"🎯 Target ATR {params.take_profit_atr_mult:.1f}: ${target:,.2f}")
+                limit, _, _ = order_plan(data, params)
+                defaults = {
+                    f"buy_limit_{symbol}": max(0.0, limit),
+                    f"buy_budget_{symbol}": params.trade_budget_usd,
+                    f"buy_confirm_{symbol}": False,
+                }
+                st.caption(f"Stop trailing Alpaca: {params.trailing_pct:.1%} dopo il fill")
             st.button("Compra", key=f"buy_{symbol}", disabled=not defaults, on_click=_on_open_panel,
                       args=(symbol, "buy", defaults))
             if trading_ok and st.session_state["bot_enabled"].get(symbol):
@@ -1254,8 +1429,14 @@ def render_watchlist(
             render_ticker_row(symbol, client, equity, positions)
 
 
-def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd.DataFrame:
+def build_watchlist_table(
+    symbols: list[str],
+    positions: dict,
+    state=None,
+    broker_orders: dict[str, list] | None = None,
+) -> pd.DataFrame:
     state = st.session_state if state is None else state
+    broker_orders = broker_orders or {}
     rows = []
     for symbol in symbols:
         data = state.get("live_data", {}).get(symbol, {})
@@ -1291,10 +1472,25 @@ def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd
         else:
             pnl_pct = float("nan")
         params = get_ticker_params(symbol, state)
-        high_water_mark = _number_or_nan(getattr(managed_position, "peak_price", entry_price))
+        saved_hwm = state.get("bot_high_water_marks", {}).get(symbol, entry_price)
+        high_water_mark = _number_or_nan(getattr(managed_position, "peak_price", saved_hwm))
         if position is not None and not math.isfinite(high_water_mark):
             high_water_mark = entry_price
-        dynamic_stop = trailing_stop_price(high_water_mark, params.trailing_pct)
+        trailing_orders = [
+            order for order in broker_orders.get(to_alpaca_symbol(symbol), [])
+            if order.symbol == to_alpaca_symbol(symbol)
+            and order.side == OrderSide.SELL
+            and str(getattr(getattr(order, "type", None), "value", getattr(order, "type", ""))).lower()
+            == OrderType.TRAILING_STOP.value
+        ]
+        broker_stop = max(
+            (
+                _number_or_nan(getattr(order, "stop_price", None))
+                for order in trailing_orders
+                if math.isfinite(_number_or_nan(getattr(order, "stop_price", None)))
+            ),
+            default=float("nan"),
+        )
         bot_enabled = bool(state.get("bot_enabled", {}).get(symbol, False))
         entry_override = _number_or_nan(state.get("bot_entry_price_overrides", {}).get(symbol))
         if math.isfinite(entry_override) and entry_override > 0:
@@ -1331,7 +1527,7 @@ def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd
             "Profilo di Rischio": state.get("profile", {}).get(symbol, DEFAULT_PROFILE),
             "Trailing stop %": params.trailing_pct * 100,
             "Prezzo Massimo Raggiunto ($)": high_water_mark,
-            "Stop Dinamico ($)": dynamic_stop if dynamic_stop is not None else float("nan"),
+            "Stop broker ($)": broker_stop,
             "Posizione": "Aperta" if position is not None else "Assente",
             "P&L ($)": pnl,
             "P&L posizione %": pnl_pct,
@@ -1353,6 +1549,13 @@ def update_bot_high_water_mark(state: dict, symbol: str, requested_value) -> boo
             continue
         symbol_state[key] = replace(position, peak_price=max(value, position.entry_price))
         changed = True
+    if changed:
+        state.setdefault("bot_high_water_marks", {})[symbol] = max(
+            _number_or_nan(getattr(symbol_state.get("position"), "peak_price", value)),
+            _number_or_nan(getattr(symbol_state.get("base"), "peak_price", value)),
+        )
+        if state is st.session_state:
+            persist_symbol_settings(state, symbol)
     return changed
 
 
@@ -1780,9 +1983,11 @@ def load_account(client) -> tuple[float | None, dict, str | None]:
 
 
 def main() -> None:
+    global _ACTIVE_TRADING_CLIENT
     st.set_page_config(page_title="Trading Dashboard ~ Watchlist", page_icon="📈", layout="wide")
     init_state()
     client, connect_error = connect_alpaca()
+    _ACTIVE_TRADING_CLIENT = client
     equity, positions, account_error = load_account(client)
     available_symbols: list[str] = []
     fractional_symbols: list[str] = []
@@ -1794,14 +1999,6 @@ def main() -> None:
                 fractional_symbols = get_fractional_asset_symbols(client, key, secret)
             except Exception as exc:
                 st.error(f"Impossibile caricare gli asset Alpaca: {exc}")
-            tracked_symbols = set(positions)
-            tracked_symbols.update(
-                to_alpaca_symbol(symbol)
-                for symbol, enabled in st.session_state["bot_enabled"].items()
-                if enabled
-            )
-            tracked_symbols.update(to_alpaca_symbol(symbol) for symbol in st.session_state["active_tickers"])
-            start_trade_update_stream(key, secret, client, sorted(tracked_symbols))
     else:
         st.warning(connect_error or NO_KEYS_MESSAGE)
 
@@ -1828,6 +2025,22 @@ def main() -> None:
     for symbol in selected_defaults:
         st.session_state["bot_enabled"].setdefault(symbol, False)
         st.session_state["profile"].setdefault(symbol, DEFAULT_PROFILE)
+    if client is not None:
+        key, secret, _ = _live_credentials()
+        if key and secret:
+            tracked_symbols = set(positions)
+            tracked_symbols.update(
+                to_alpaca_symbol(symbol)
+                for symbol, enabled in st.session_state["bot_enabled"].items()
+                if enabled
+            )
+            tracked_symbols.update(to_alpaca_symbol(symbol) for symbol in st.session_state["active_tickers"])
+            tracked_symbols.update(to_alpaca_symbol(symbol) for symbol in selected_defaults)
+            for symbol in tracked_symbols:
+                if symbol not in _REGISTERED_TRAILING_SYMBOLS:
+                    register_trade_update_handler(symbol, _attach_dashboard_trailing_stop)
+                    _REGISTERED_TRAILING_SYMBOLS.add(symbol)
+            start_trade_update_stream(key, secret, client, sorted(tracked_symbols))
 
     controls = st.columns([1, 1, 5], vertical_alignment="center")
     controls[0].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
@@ -1847,13 +2060,32 @@ def main() -> None:
             st.session_state.get("detail_symbol_selected"),
         ]
     )
+    if client is not None:
+        for symbol in active_symbols:
+            alpaca_symbol = to_alpaca_symbol(symbol)
+            if alpaca_symbol not in _REGISTERED_TRAILING_SYMBOLS:
+                register_trade_update_handler(alpaca_symbol, _attach_dashboard_trailing_stop)
+                _REGISTERED_TRAILING_SYMBOLS.add(alpaca_symbol)
     refresh_symbols = get_active_symbols(
         [*active_symbols, *st.session_state.get("market_radar_visible_symbols", [])]
     )
     render_refresh_controller(client, equity, positions, refresh_symbols)
 
     if active_symbols:
-        personal_table = build_watchlist_table(active_symbols, positions)
+        open_orders_by_symbol = {}
+        if client is not None:
+            try:
+                open_orders_by_symbol = {
+                    to_alpaca_symbol(symbol): _open_orders(client, to_alpaca_symbol(symbol))
+                    for symbol in active_symbols
+                }
+            except Exception as exc:
+                st.error(f"Impossibile leggere gli ordini stop effettivi da Alpaca: {exc}")
+        personal_table = build_watchlist_table(
+            active_symbols,
+            positions,
+            broker_orders=open_orders_by_symbol,
+        )
         st.session_state["detail_source_table"] = personal_table
         edited_personal = st.data_editor(
             personal_table,
@@ -1891,7 +2123,10 @@ def main() -> None:
                     min_value=0.0,
                     step=0.01,
                 ),
-                "Stop Dinamico ($)": st.column_config.NumberColumn(format="$%.2f"),
+                "Stop broker ($)": st.column_config.NumberColumn(
+                    format="$%.2f",
+                    help="Prezzo stop corrente riportato dall'ordine trailing aperto su Alpaca.",
+                ),
                 "Prezzo attuale ($)": st.column_config.NumberColumn(format="$%.2f"),
                 "Var. giornaliera %": st.column_config.NumberColumn(format="%.2f%%"),
                 "Prezzo medio acquisto ($)": st.column_config.NumberColumn(format="$%.2f"),
@@ -1933,6 +2168,22 @@ def main() -> None:
             if profile in PROFILE_NAMES:
                 st.session_state["profile"][symbol] = profile
                 st.session_state[f"profile_{symbol}"] = profile
+            if profile != previous_profile or trailing_pct_changed:
+                try:
+                    updated = replace_trailing_stop_percent(
+                        client,
+                        to_alpaca_symbol(symbol),
+                        get_ticker_params(symbol).trailing_pct,
+                    ) if client is not None else 0
+                    if updated == 0 and positions.get(to_alpaca_symbol(symbol)) is not None:
+                        add_log(st.session_state, f"⚠️ {symbol}: nessun trailing stop aperto da aggiornare su Alpaca")
+                except Exception as exc:
+                    st.session_state["panel_msg"][symbol] = (
+                        "error",
+                        f"Impostazione salvata ma trailing stop Alpaca non aggiornato: {exc}",
+                    )
+                    add_log(st.session_state, f"⚠️ {symbol}: replace del trailing Alpaca fallito: {exc}")
+                persist_symbol_settings(st.session_state, symbol)
             update_bot_high_water_mark(
                 st.session_state,
                 symbol,
@@ -1962,7 +2213,11 @@ def main() -> None:
             "Compra",
             key=f"quick_buy_{detail_symbol}",
             on_click=_on_open_panel,
-            args=(detail_symbol, "buy", {f"buy_limit_{detail_symbol}": 0.0, f"buy_stop_{detail_symbol}": 0.0, f"buy_budget_{detail_symbol}": 100.0, f"buy_confirm_{detail_symbol}": False}),
+            args=(detail_symbol, "buy", {
+                f"buy_limit_{detail_symbol}": 0.0,
+                f"buy_budget_{detail_symbol}": 100.0,
+                f"buy_confirm_{detail_symbol}": False,
+            }),
         )
         actions[1].button(
             "Vendi",

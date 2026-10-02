@@ -57,7 +57,7 @@ def test_bollinger_trailing_activation_does_not_lower_high_water_mark():
     assert updated.peak_price == 120.0
 
 
-def test_live_exit_submits_market_sell_when_trailing_stop_is_crossed(monkeypatch):
+def test_live_position_exit_is_delegated_to_native_broker_trailing_stop(monkeypatch):
     position = Position(
         entry_date=pd.Timestamp("2026-01-01"),
         entry_price=100.0,
@@ -66,41 +66,23 @@ def test_live_exit_submits_market_sell_when_trailing_stop_is_crossed(monkeypatch
         entry_commission=0.0,
         peak_price=110.0,
     )
-    sell_orders = []
-    cancelled_orders = []
-    protective_order = SimpleNamespace(symbol="SPY", side=live_trader.OrderSide.SELL, id="stop-order")
-    open_order_snapshots = iter([[protective_order], []])
+    attached = []
     monkeypatch.setattr(live_trader, "has_open_position", lambda client, symbol: True)
-    monkeypatch.setattr(live_trader, "get_latest_bars", lambda symbol: pd.DataFrame())
-    monkeypatch.setattr(live_trader, "prepare_data", lambda bars: pd.DataFrame(
-        [{"Open": 104.0, "High": 110.0, "Low": 102.0, "Close": 103.0, "BB_mid": 100.0, "ATR": 1.0}],
-        index=[pd.Timestamp.now(tz=live_trader.EASTERN)],
-    ))
-    monkeypatch.setattr(
-        live_trader,
-        "_open_orders",
-        lambda client, symbol: next(open_order_snapshots),
-    )
     monkeypatch.setattr(live_trader, "get_open_position", lambda client, symbol: SimpleNamespace(qty="2"))
     monkeypatch.setattr(
         live_trader,
-        "place_market_sell",
-        lambda client, symbol, qty: sell_orders.append((symbol, qty)) or "sell-order-id",
+        "ensure_native_trailing_stop",
+        lambda client, symbol, pct, qty: attached.append((symbol, pct, qty)),
     )
-    state = {
-        "position": position,
-        "base": position,
-        "day": datetime.now(live_trader.EASTERN).date(),
-    }
+    state = {"position": position, "base": position}
 
     decision = live_trader._check_exit_once(
-        SimpleNamespace(cancel_order_by_id=cancelled_orders.append),
+        object(),
         "SPY",
         state,
         live_trader.StrategyParams(trailing_pct=0.06),
     )
 
-    assert decision.reason is ExitReason.TRAILING_STOP
-    assert cancelled_orders == ["stop-order"]
-    assert sell_orders == [("SPY", 2.0)]
-    assert state["pending_exit"] == "sell-order-id"
+    assert decision is None
+    assert attached == [("SPY", 0.06, 2.0)]
+    assert state["position"] == position

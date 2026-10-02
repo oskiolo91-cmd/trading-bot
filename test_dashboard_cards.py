@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from uuid import uuid4
 from types import SimpleNamespace
-from alpaca.trading.enums import AssetClass, AssetStatus
+from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, OrderType
 
 import dashboard
 
@@ -116,7 +116,7 @@ def test_risk_profiles_set_trailing_stop_percentages():
         assert params.trailing_pct == trailing_pct
 
 
-def test_watchlist_table_shows_profile_high_water_mark_and_derived_stop():
+def test_watchlist_table_shows_profile_hwm_and_broker_stop():
     state = {
         "live_data": {"SPY": {"price": 110.0, "prev_close": 109.0}},
         "bot_enabled": {"SPY": True},
@@ -125,12 +125,22 @@ def test_watchlist_table_shows_profile_high_water_mark_and_derived_stop():
     }
     positions = {"SPY": SimpleNamespace(avg_entry_price=100.0)}
 
-    table = dashboard.build_watchlist_table(["SPY"], positions, state)
+    broker_orders = {
+        "SPY": [
+            SimpleNamespace(
+                symbol="SPY",
+                side=OrderSide.SELL,
+                type=OrderType.TRAILING_STOP,
+                stop_price=113.25,
+            )
+        ]
+    }
+    table = dashboard.build_watchlist_table(["SPY"], positions, state, broker_orders)
 
     assert table.loc[0, "Profilo di Rischio"] == "⚖️ Bilanciato"
     assert table.loc[0, "Trailing stop %"] == 6.0
     assert table.loc[0, "Prezzo Massimo Raggiunto ($)"] == 120.0
-    assert round(table.loc[0, "Stop Dinamico ($)"], 2) == 112.8
+    assert table.loc[0, "Stop broker ($)"] == 113.25
     assert table.loc[0, "Prezzo ingresso bot ($)"] == 100.0
     assert table.loc[0, "Stato ingresso bot"] == "Eseguito"
 
@@ -157,7 +167,7 @@ def test_bot_entry_value_is_editable_and_override_changes_next_order_plan():
     }
 
     table = dashboard.build_watchlist_table(["NVDA"], {}, state)
-    limit, stop, shares = dashboard.order_plan(
+    limit, trailing_pct, shares = dashboard.order_plan(
         state["live_data"]["NVDA"],
         dashboard.get_ticker_params("NVDA", state),
         entry_price_override=state["bot_entry_price_overrides"]["NVDA"],
@@ -165,10 +175,10 @@ def test_bot_entry_value_is_editable_and_override_changes_next_order_plan():
 
     assert table.loc[0, "Prezzo ingresso bot ($)"] == 90.0
     assert table.loc[0, "Stato ingresso bot"] == "Personalizzato"
-    assert (limit, stop, shares) == (90.0, 86.0, 1.1111)
+    assert (limit, trailing_pct, shares) == (90.0, 0.06, 1)
 
 
-def test_manual_trailing_percentage_overrides_profile_and_drives_dynamic_stop():
+def test_manual_trailing_percentage_overrides_profile_without_local_stop_calculation():
     state = {
         "profile": {"SPY": "🐢 Conservativo"},
         "trailing_stop_pct": {"SPY": 0.047},
@@ -177,11 +187,21 @@ def test_manual_trailing_percentage_overrides_profile_and_drives_dynamic_stop():
     positions = {"SPY": SimpleNamespace(avg_entry_price=100.0)}
 
     params = dashboard.get_ticker_params("SPY", state)
-    table = dashboard.build_watchlist_table(["SPY"], positions, state)
+    table = dashboard.build_watchlist_table(
+        ["SPY"],
+        positions,
+        state,
+        {"SPY": [SimpleNamespace(
+            symbol="SPY",
+            side=OrderSide.SELL,
+            type=OrderType.TRAILING_STOP,
+            stop_price=114.11,
+        )]},
+    )
 
     assert params.trailing_pct == 0.047
     assert table.loc[0, "Trailing stop %"] == 4.7
-    assert round(table.loc[0, "Stop Dinamico ($)"], 2) == 114.36
+    assert table.loc[0, "Stop broker ($)"] == 114.11
 
 
 def test_portfolio_history_frame_and_chart_use_equity_points():
@@ -215,3 +235,24 @@ def test_watchlist_can_raise_but_not_lower_bot_high_water_mark():
     assert state["bot_state"]["SPY"]["position"].peak_price == 120.0
     assert state["bot_state"]["SPY"]["base"].peak_price == 120.0
     assert not dashboard.update_bot_high_water_mark(state, "SPY", 105.0)
+
+
+def test_bot_does_not_mark_buy_day_when_broker_rejects_order(monkeypatch):
+    state = {
+        "bot_enabled": {"SPY": True},
+        "live_data": {"SPY": {"price": 100.0, "atr": 2.0, "bb_lower": 100.0}},
+        "profile": {"SPY": dashboard.DEFAULT_PROFILE},
+    }
+    client = SimpleNamespace(get_clock=lambda: SimpleNamespace(is_open=True))
+
+    def reject_order(*args, **kwargs):
+        raise RuntimeError("rejected")
+
+    monkeypatch.setattr(dashboard, "get_symbol_daily_pnl", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(dashboard, "compute_signal", lambda *args, **kwargs: True)
+    monkeypatch.setattr(dashboard, "_open_orders", lambda *args, **kwargs: [])
+    monkeypatch.setattr(dashboard, "place_limit_buy", reject_order)
+
+    dashboard.run_bot_cycle(client, state, {}, 10_000)
+
+    assert "SPY" not in state.get("bot_last_buy", {})
