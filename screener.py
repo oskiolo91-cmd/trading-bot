@@ -364,8 +364,10 @@ def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
         ticker = yf.Ticker(_yahoo_symbol(symbol), session=session)
     except TypeError:
         ticker = yf.Ticker(_yahoo_symbol(symbol))
+
     info: dict[str, Any] = {}
     last_error: Exception | None = None
+    rate_limited = False
 
     for attempt in range(3):
         try:
@@ -376,10 +378,11 @@ def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
         except Exception as exc:
             last_error = exc
             message = str(exc).lower()
-            if "too many requests" in message or "429" in message:
+            if "too many requests" in message or "429" in message or "rate limit" in message:
+                rate_limited = True
                 LOG.warning("Rate limit raggiunto, pausa di 60 secondi... (%s)", symbol)
                 time_module.sleep(60)
-                continue
+                break
             LOG.warning("Metadata fetch failed for %s (attempt %s/3): %s", symbol, attempt + 1, exc)
 
         try:
@@ -400,6 +403,13 @@ def _fetch_yahoo_metadata(symbol: str) -> dict[str, Any]:
 
         if attempt < 2:
             time_module.sleep(0.5 * (attempt + 1))
+
+    if rate_limited:
+        return {
+            "Sector": "Unknown",
+            "QuoteType": "Equity",
+            "MarketCap": None,
+        }
 
     if not info and last_error is not None:
         LOG.warning("Using fallback metadata for %s after repeated Yahoo failures", symbol)
@@ -506,16 +516,23 @@ def generate_market_radar(
             symbol for symbol in batch
             if _metadata_value_is_missing(cached_metadata.get(symbol, {}).get("Sector"))
         ]
-        with ThreadPoolExecutor(max_workers=max(1, min(metadata_workers, len(missing_metadata)))) as executor:
-            futures = {executor.submit(_fetch_yahoo_metadata, symbol): symbol for symbol in missing_metadata}
-            for future in as_completed(futures):
-                symbol = futures[future]
+        if not missing_metadata:
+            for symbol in batch:
+                metadata_by_symbol[symbol] = cached_metadata.get(symbol, {
+                    "Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None,
+                })
+        else:
+            for symbol in missing_metadata:
                 try:
-                    fresh = future.result()
+                    fresh = _fetch_yahoo_metadata(symbol)
                 except Exception:
                     LOG.exception("Could not load metadata for %s", symbol)
                     fresh = {"Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None}
                 cached_metadata[symbol] = _merge_metadata_with_cache(cached_metadata.get(symbol, {}), fresh)
+            for symbol in batch:
+                metadata_by_symbol[symbol] = cached_metadata.get(symbol, {
+                    "Sector": "Unknown", "QuoteType": "Equity", "MarketCap": None,
+                })
 
         for symbol in batch:
             metadata_by_symbol[symbol] = cached_metadata.get(symbol, {
