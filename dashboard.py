@@ -17,6 +17,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest
@@ -1173,14 +1174,32 @@ def paginate_market_radar(filtered: pd.DataFrame, page: int, page_size: int) -> 
     return filtered.iloc[start:start + page_size].copy(), page_count
 
 
-def render_market_explorer(positions: dict, available_symbols: list[str]) -> list[str]:
+def render_market_explorer(positions: dict, available_symbols: list[str], trading_client=None) -> list[str]:
     st.subheader("Tutti i ticker")
     search_col, sector_col, type_col = st.columns([1.6, 1.4, 1.2])
     selected_symbols = []
     search_query = search_col.text_input("Cerca nel radar", key="radar_search")
     radar_path = BOT_DIR / "market_radar.csv"
     if not radar_path.exists():
-        st.info("Market radar non ancora generato. Esegui `python screener.py` per crearlo.")
+        if not available_symbols or trading_client is None:
+            st.info("Ricerca non ancora generata. Serve una connessione Alpaca per caricare gli asset disponibili.")
+        else:
+            st.info(f"Ricerca non ancora generata. Genera i dati per {len(available_symbols)} asset Alpaca.")
+            if st.button("Genera tabella di ricerca", key="generate_market_radar"):
+                key, secret, _ = _live_credentials()
+                try:
+                    from screener import generate_market_radar
+
+                    with st.spinner("Caricamento ticker e indicatori di mercato…"):
+                        generate_market_radar(
+                            symbols=available_symbols,
+                            output_path=radar_path,
+                            trading_client=trading_client,
+                            data_client=StockHistoricalDataClient(key, secret),
+                        )
+                    st.rerun(scope="app")
+                except Exception as exc:
+                    st.error(f"Impossibile generare la tabella di ricerca: {exc}")
         return selected_symbols
     try:
         radar = pd.read_csv(radar_path)
@@ -1402,7 +1421,7 @@ def main() -> None:
     controls = st.columns([1, 1, 5], vertical_alignment="center")
     controls[0].button("🔄 Aggiorna ora", on_click=_on_refresh_now, width="stretch")
     controls[1].toggle("Auto-refresh", key="auto_refresh")
-    selected_symbols = render_market_explorer(positions, available_symbols)
+    selected_symbols = render_market_explorer(positions, available_symbols, client)
 
     position_symbols = [
         symbol for symbol, position in positions.items()

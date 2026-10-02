@@ -48,14 +48,23 @@ def test_radar_exports_schema_and_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(screener, "_fetch_yahoo_metadata", lambda symbol: {
         "Sector": "Technology", "QuoteType": "Equity", "MarketCap": 123_000_000,
     })
-    monkeypatch.setattr(screener, "fetch_daily_bars", lambda symbols, **kwargs: {symbol: frame for symbol in symbols})
+    data_client = object()
+    received_clients = []
+
+    def fake_fetch_daily_bars(symbols, **kwargs):
+        received_clients.append(kwargs.get("client"))
+        return {symbol: frame for symbol in symbols}
+
+    monkeypatch.setattr(screener, "fetch_daily_bars", fake_fetch_daily_bars)
 
     class FakeTradingClient:
         def get_clock(self):
             return type("Clock", (), {"is_open": False})()
 
     output = tmp_path / "market_radar.csv"
-    radar = screener.generate_market_radar(["SPY"], output, trading_client=FakeTradingClient())
+    radar = screener.generate_market_radar(
+        ["SPY"], output, trading_client=FakeTradingClient(), data_client=data_client
+    )
     stored = pd.read_csv(output)
 
     assert output.exists()
@@ -63,3 +72,4 @@ def test_radar_exports_schema_and_metadata(tmp_path, monkeypatch):
     assert stored.loc[0, "Sector"] == "Technology"
     assert stored.loc[0, "QuoteType"] == "Equity"
     assert stored.loc[0, "Symbol"] == "SPY"
+    assert received_clients == [data_client]

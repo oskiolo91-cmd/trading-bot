@@ -154,6 +154,7 @@ def generate_market_radar(
     output_path: str | Path = MARKET_RADAR_PATH,
     metadata_workers: int = 8,
     trading_client=None,
+    data_client=None,
 ) -> pd.DataFrame:
     """Build market_radar.csv using batched Alpaca daily bars and Yahoo metadata."""
     symbols = list(dict.fromkeys(symbols or load_index_universe()))
@@ -187,7 +188,7 @@ def generate_market_radar(
     for offset in range(0, len(symbols), 50):
         batch = symbols[offset:offset + 50]
         alpaca_symbols = [symbol.replace("-", ".") for symbol in batch]
-        frames = fetch_daily_bars(alpaca_symbols, start=start, end=end)
+        frames = fetch_daily_bars(alpaca_symbols, start=start, end=end, client=data_client)
         for symbol, alpaca_symbol in zip(batch, alpaca_symbols):
             frame = _last_closed_bars(frames.get(alpaca_symbol, pd.DataFrame()), market_is_open)
             try:
