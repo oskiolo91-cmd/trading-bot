@@ -128,8 +128,25 @@ def test_watchlist_table_shows_profile_high_water_mark_and_derived_stop():
     table = dashboard.build_watchlist_table(["SPY"], positions, state)
 
     assert table.loc[0, "Profilo di Rischio"] == "⚖️ Bilanciato"
+    assert table.loc[0, "Trailing stop %"] == 6.0
     assert table.loc[0, "Prezzo Massimo Raggiunto ($)"] == 120.0
     assert round(table.loc[0, "Stop Dinamico ($)"], 2) == 112.8
+
+
+def test_manual_trailing_percentage_overrides_profile_and_drives_dynamic_stop():
+    state = {
+        "profile": {"SPY": "🐢 Conservativo"},
+        "trailing_stop_pct": {"SPY": 0.047},
+        "bot_state": {"SPY": {"position": SimpleNamespace(peak_price=120.0)}},
+    }
+    positions = {"SPY": SimpleNamespace(avg_entry_price=100.0)}
+
+    params = dashboard.get_ticker_params("SPY", state)
+    table = dashboard.build_watchlist_table(["SPY"], positions, state)
+
+    assert params.trailing_pct == 0.047
+    assert table.loc[0, "Trailing stop %"] == 4.7
+    assert round(table.loc[0, "Stop Dinamico ($)"], 2) == 114.36
 
 
 def test_watchlist_can_raise_but_not_lower_bot_high_water_mark():

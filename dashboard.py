@@ -191,20 +191,23 @@ def get_ticker_params(symbol: str, state=None) -> StrategyParams:
     state = st.session_state if state is None else state
     name = state.get("profile", {}).get(symbol, DEFAULT_PROFILE)
     params = PROFILES.get(name, PROFILES[DEFAULT_PROFILE])
-    if params is not None:
-        return params
-    base = PROFILES[DEFAULT_PROFILE]
-    return replace(
-        base,
-        adx_max=float(state.get(f"custom_adx_{symbol}", base.adx_max)),
-        rsi_max=float(state.get(f"custom_rsi_{symbol}", base.rsi_max)),
-        trade_budget_usd=float(state.get(f"custom_budget_{symbol}", base.trade_budget_usd)),
-        stop_loss_atr_mult=float(state.get(f"custom_stop_atr_{symbol}", base.stop_loss_atr_mult)),
-        take_profit_atr_mult=float(state.get(f"custom_take_profit_atr_{symbol}", base.take_profit_atr_mult)),
-        trailing_pct=float(state.get(f"custom_trailing_pct_{symbol}", base.trailing_pct)),
-        daily_target_usd=float(state.get(f"custom_daily_target_{symbol}", base.daily_target_usd)),
-        max_daily_drawdown_usd=float(state.get(f"custom_max_drawdown_{symbol}", base.max_daily_drawdown_usd)),
-    )
+    if params is None:
+        base = PROFILES[DEFAULT_PROFILE]
+        params = replace(
+            base,
+            adx_max=float(state.get(f"custom_adx_{symbol}", base.adx_max)),
+            rsi_max=float(state.get(f"custom_rsi_{symbol}", base.rsi_max)),
+            trade_budget_usd=float(state.get(f"custom_budget_{symbol}", base.trade_budget_usd)),
+            stop_loss_atr_mult=float(state.get(f"custom_stop_atr_{symbol}", base.stop_loss_atr_mult)),
+            take_profit_atr_mult=float(state.get(f"custom_take_profit_atr_{symbol}", base.take_profit_atr_mult)),
+            trailing_pct=float(state.get(f"custom_trailing_pct_{symbol}", base.trailing_pct)),
+            daily_target_usd=float(state.get(f"custom_daily_target_{symbol}", base.daily_target_usd)),
+            max_daily_drawdown_usd=float(state.get(f"custom_max_drawdown_{symbol}", base.max_daily_drawdown_usd)),
+        )
+    trailing_override = state.get("trailing_stop_pct", {}).get(symbol)
+    if trailing_override is not None:
+        params = replace(params, trailing_pct=float(trailing_override))
+    return params
 
 
 def run_profile_backtest(symbol: str) -> dict[str, BacktestResult]:
@@ -1217,6 +1220,7 @@ def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd
             "Segnale": "Sì" if compute_signal(data, get_ticker_params(symbol, state)) else "No",
             "Bot": bool(state.get("bot_enabled", {}).get(symbol, False)),
             "Profilo di Rischio": state.get("profile", {}).get(symbol, DEFAULT_PROFILE),
+            "Trailing stop %": params.trailing_pct * 100,
             "Prezzo Massimo Raggiunto ($)": high_water_mark,
             "Stop Dinamico ($)": dynamic_stop if dynamic_stop is not None else float("nan"),
             "Posizione": "Aperta" if position is not None else "Assente",
@@ -1718,7 +1722,10 @@ def main() -> None:
             use_container_width=True,
             disabled=[
                 column for column in personal_table.columns
-                if column not in {"Bot", "Ticker", "Profilo di Rischio", "Prezzo Massimo Raggiunto ($)"}
+                if column not in {
+                    "Bot", "Ticker", "Profilo di Rischio", "Trailing stop %",
+                    "Prezzo Massimo Raggiunto ($)",
+                }
             ],
             key="my_ticker_table",
             column_config={
@@ -1733,6 +1740,12 @@ def main() -> None:
                     "Profilo di Rischio",
                     options=PROFILE_NAMES,
                     required=True,
+                ),
+                "Trailing stop %": st.column_config.NumberColumn(
+                    format="%.1f%%",
+                    min_value=0.1,
+                    max_value=99.0,
+                    step=0.1,
                 ),
                 "Prezzo Massimo Raggiunto ($)": st.column_config.NumberColumn(
                     format="$%.2f",
@@ -1758,6 +1771,19 @@ def main() -> None:
             symbol = str(row["Ticker"])
             st.session_state["bot_enabled"][symbol] = bool(row["Bot"])
             profile = str(row["Profilo di Rischio"])
+            previous_profile = st.session_state["profile"].get(symbol, DEFAULT_PROFILE)
+            original_row = personal_table.loc[personal_table["Ticker"] == symbol].iloc[0]
+            requested_trailing_pct = _number_or_nan(row["Trailing stop %"])
+            original_trailing_pct = _number_or_nan(original_row["Trailing stop %"])
+            trailing_pct_changed = (
+                math.isfinite(requested_trailing_pct)
+                and not math.isclose(requested_trailing_pct, original_trailing_pct)
+            )
+            trailing_overrides = st.session_state.setdefault("trailing_stop_pct", {})
+            if profile != previous_profile and not trailing_pct_changed:
+                trailing_overrides.pop(symbol, None)
+            elif math.isfinite(requested_trailing_pct) and 0.1 <= requested_trailing_pct <= 99.0:
+                trailing_overrides[symbol] = requested_trailing_pct / 100.0
             if profile in PROFILE_NAMES:
                 st.session_state["profile"][symbol] = profile
                 st.session_state[f"profile_{symbol}"] = profile
