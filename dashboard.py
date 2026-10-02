@@ -46,7 +46,8 @@ def resolve_market_radar_path(output_path: str | Path | None = None) -> Path:
 
 from backtest import BacktestResult, download_daily_bars, prepare_data, run_backtest
 from alpaca_data import fetch_daily_bars
-from models import StrategyParams
+from models import Position, StrategyParams
+from signals import trailing_stop_price
 from live_trader import (
     _check_exit_once, _initial_position, _open_orders, close_symbol_position,
     get_account_value, get_alpaca_client, get_symbol_daily_pnl,
@@ -62,9 +63,9 @@ LOG_LIMIT = 200
 ROW_WIDTHS = [1.6, 1, 1, 1.2, 1.5, 1.8]
 PARAMS = StrategyParams()
 PROFILES = {
-    "🐢 Conservativo": StrategyParams(adx_max=20, rsi_max=30, trade_budget_usd=50, stop_loss_atr_mult=2.5, take_profit_atr_mult=3.0, daily_target_usd=2.0),
-    "⚖️ Bilanciato": StrategyParams(adx_max=25, rsi_max=35, trade_budget_usd=100, stop_loss_atr_mult=2.0, take_profit_atr_mult=3.0, daily_target_usd=5.0),
-    "🚀 Speculativo": StrategyParams(adx_max=35, rsi_max=45, trade_budget_usd=200, stop_loss_atr_mult=1.5, take_profit_atr_mult=2.5, daily_target_usd=10.0),
+    "🐢 Conservativo": StrategyParams(adx_max=20, rsi_max=30, trade_budget_usd=50, stop_loss_atr_mult=2.5, take_profit_atr_mult=3.0, daily_target_usd=2.0, trailing_pct=0.03),
+    "⚖️ Bilanciato": StrategyParams(adx_max=25, rsi_max=35, trade_budget_usd=100, stop_loss_atr_mult=2.0, take_profit_atr_mult=3.0, daily_target_usd=5.0, trailing_pct=0.06),
+    "🚀 Speculativo": StrategyParams(adx_max=35, rsi_max=45, trade_budget_usd=200, stop_loss_atr_mult=1.5, take_profit_atr_mult=2.5, daily_target_usd=10.0, trailing_pct=0.12),
     "🎛️ Custom": None,
 }
 PROFILE_NAMES = list(PROFILES.keys())
@@ -200,6 +201,7 @@ def get_ticker_params(symbol: str, state=None) -> StrategyParams:
         trade_budget_usd=float(state.get(f"custom_budget_{symbol}", base.trade_budget_usd)),
         stop_loss_atr_mult=float(state.get(f"custom_stop_atr_{symbol}", base.stop_loss_atr_mult)),
         take_profit_atr_mult=float(state.get(f"custom_take_profit_atr_{symbol}", base.take_profit_atr_mult)),
+        trailing_pct=float(state.get(f"custom_trailing_pct_{symbol}", base.trailing_pct)),
         daily_target_usd=float(state.get(f"custom_daily_target_{symbol}", base.daily_target_usd)),
         max_daily_drawdown_usd=float(state.get(f"custom_max_drawdown_{symbol}", base.max_daily_drawdown_usd)),
     )
@@ -1008,6 +1010,7 @@ def render_custom_sliders(symbol: str) -> None:
                 f"custom_budget_{symbol}": float(base.trade_budget_usd),
                 f"custom_stop_atr_{symbol}": float(base.stop_loss_atr_mult),
                 f"custom_take_profit_atr_{symbol}": float(base.take_profit_atr_mult),
+                f"custom_trailing_pct_{symbol}": float(base.trailing_pct),
                 f"custom_daily_target_{symbol}": float(base.daily_target_usd),
                 f"custom_max_drawdown_{symbol}": float(base.max_daily_drawdown_usd)}
     for key, value in defaults.items():
@@ -1015,14 +1018,15 @@ def render_custom_sliders(symbol: str) -> None:
             st.session_state[key] = value
     with st.container(border=True):
         st.caption(f"🎛️ Profilo Custom ~ {symbol}")
-        cols = st.columns(7)
+        cols = st.columns(8)
         cols[0].slider("ADX max", 15.0, 50.0, step=1.0, key=f"custom_adx_{symbol}")
         cols[1].slider("RSI max", 25.0, 60.0, step=1.0, key=f"custom_rsi_{symbol}")
         cols[2].number_input("Budget $", min_value=1.0, step=25.0, key=f"custom_budget_{symbol}")
         cols[3].slider("Stop ATR mult", 0.5, 4.0, step=0.1, key=f"custom_stop_atr_{symbol}")
         cols[4].slider("Target ATR mult", 0.1, 5.0, step=0.1, key=f"custom_take_profit_atr_{symbol}")
-        cols[5].number_input("Daily target $", min_value=0.1, step=1.0, key=f"custom_daily_target_{symbol}")
-        cols[6].number_input("Daily loss cap $", min_value=0.1, step=1.0, key=f"custom_max_drawdown_{symbol}")
+        cols[5].slider("Trailing stop %", 0.01, 0.20, step=0.01, key=f"custom_trailing_pct_{symbol}")
+        cols[6].number_input("Daily target $", min_value=0.1, step=1.0, key=f"custom_daily_target_{symbol}")
+        cols[7].number_input("Daily loss cap $", min_value=0.1, step=1.0, key=f"custom_max_drawdown_{symbol}")
 
 
 def backtest_chart(table: pd.DataFrame) -> go.Figure:
@@ -1165,6 +1169,8 @@ def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd
     for symbol in symbols:
         data = state.get("live_data", {}).get(symbol, {})
         position = positions.get(to_alpaca_symbol(symbol))
+        bot_state = state.get("bot_state", {}).get(symbol, {})
+        managed_position = bot_state.get("position", bot_state.get("base"))
         price = data.get("price")
         if price is None and position is not None:
             price = getattr(position, "current_price", None)
@@ -1193,6 +1199,11 @@ def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd
             pnl_pct = pnl / invested * 100
         else:
             pnl_pct = float("nan")
+        params = get_ticker_params(symbol, state)
+        high_water_mark = _number_or_nan(getattr(managed_position, "peak_price", entry_price))
+        if position is not None and not math.isfinite(high_water_mark):
+            high_water_mark = entry_price
+        dynamic_stop = trailing_stop_price(high_water_mark, params.trailing_pct)
         rows.append({
             "Ticker": symbol,
             "Prezzo attuale ($)": price,
@@ -1205,11 +1216,31 @@ def build_watchlist_table(symbols: list[str], positions: dict, state=None) -> pd
             "RSI": data.get("rsi", float("nan")),
             "Segnale": "Sì" if compute_signal(data, get_ticker_params(symbol, state)) else "No",
             "Bot": bool(state.get("bot_enabled", {}).get(symbol, False)),
+            "Profilo di Rischio": state.get("profile", {}).get(symbol, DEFAULT_PROFILE),
+            "Prezzo Massimo Raggiunto ($)": high_water_mark,
+            "Stop Dinamico ($)": dynamic_stop if dynamic_stop is not None else float("nan"),
             "Posizione": "Aperta" if position is not None else "Assente",
             "P&L ($)": pnl,
             "P&L posizione %": pnl_pct,
         })
     return pd.DataFrame(rows)
+
+
+def update_bot_high_water_mark(state: dict, symbol: str, requested_value) -> bool:
+    value = _number_or_nan(requested_value)
+    if not math.isfinite(value) or value <= 0:
+        return False
+    symbol_state = state.get("bot_state", {}).get(symbol)
+    if not symbol_state:
+        return False
+    changed = False
+    for key in ("position", "base"):
+        position = symbol_state.get(key)
+        if not isinstance(position, Position) or value <= position.peak_price:
+            continue
+        symbol_state[key] = replace(position, peak_price=max(value, position.entry_price))
+        changed = True
+    return changed
 
 
 def _number_or_nan(value) -> float:
@@ -1685,7 +1716,10 @@ def main() -> None:
             personal_table,
             hide_index=True,
             use_container_width=True,
-            disabled=[column for column in personal_table.columns if column not in {"Bot", "Ticker"}],
+            disabled=[
+                column for column in personal_table.columns
+                if column not in {"Bot", "Ticker", "Profilo di Rischio", "Prezzo Massimo Raggiunto ($)"}
+            ],
             key="my_ticker_table",
             column_config={
                 "Ticker": st.column_config.ButtonColumn(
@@ -1695,6 +1729,17 @@ def main() -> None:
                     args=("detail_source_table", "my_ticker_table_click"),
                     key="my_ticker_table_click",
                 ),
+                "Profilo di Rischio": st.column_config.SelectboxColumn(
+                    "Profilo di Rischio",
+                    options=PROFILE_NAMES,
+                    required=True,
+                ),
+                "Prezzo Massimo Raggiunto ($)": st.column_config.NumberColumn(
+                    format="$%.2f",
+                    min_value=0.0,
+                    step=0.01,
+                ),
+                "Stop Dinamico ($)": st.column_config.NumberColumn(format="$%.2f"),
                 "Prezzo attuale ($)": st.column_config.NumberColumn(format="$%.2f"),
                 "Var. giornaliera %": st.column_config.NumberColumn(format="%.2f%%"),
                 "Prezzo medio acquisto ($)": st.column_config.NumberColumn(format="$%.2f"),
@@ -1712,6 +1757,15 @@ def main() -> None:
         for _, row in edited_personal.iterrows():
             symbol = str(row["Ticker"])
             st.session_state["bot_enabled"][symbol] = bool(row["Bot"])
+            profile = str(row["Profilo di Rischio"])
+            if profile in PROFILE_NAMES:
+                st.session_state["profile"][symbol] = profile
+                st.session_state[f"profile_{symbol}"] = profile
+            update_bot_high_water_mark(
+                st.session_state,
+                symbol,
+                row["Prezzo Massimo Raggiunto ($)"],
+            )
         active_tickers = set(st.session_state.get("active_tickers", []))
         active_tickers = {symbol for symbol in active_tickers if symbol in set(edited_personal["Ticker"].astype(str))} | set(
             edited_personal[edited_personal["Bot"] == True]["Ticker"].astype(str)
