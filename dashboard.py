@@ -1121,13 +1121,8 @@ def paginate_market_radar(filtered: pd.DataFrame, page: int, page_size: int) -> 
 
 def render_market_explorer(positions: dict, available_symbols: list[str]) -> list[str]:
     st.subheader("Tutti i ticker")
-    selection_col, search_col, sector_col, type_col = st.columns([2.2, 1.2, 1.4, 1.2])
-    selected_symbols = selection_col.multiselect(
-        "I miei ticker",
-        options=available_symbols,
-        key="selected_tickers",
-        placeholder="Cerca e aggiungi ticker…",
-    )
+    search_col, sector_col, type_col = st.columns([1.6, 1.4, 1.2])
+    selected_symbols = []
     search_query = search_col.text_input("Cerca nel radar", key="radar_search")
     radar_path = BOT_DIR / "market_radar.csv"
     if not radar_path.exists():
