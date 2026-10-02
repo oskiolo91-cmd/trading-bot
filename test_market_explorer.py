@@ -48,6 +48,19 @@ def test_market_radar_with_empty_filters_shows_everything():
     assert filtered["Symbol"].tolist() == ["A", "B"]
 
 
+def test_market_radar_search_matches_security_name_not_symbol():
+    radar = pd.DataFrame([
+        {"Symbol": "AAPL", "SecurityName": "Apple Inc."},
+        {"Symbol": "MSFT", "SecurityName": "Microsoft Corporation"},
+    ])
+
+    by_company = dashboard.search_market_radar_by_security(radar, "MICRO")
+    by_ticker = dashboard.search_market_radar_by_security(radar, "MSFT")
+
+    assert by_company["Symbol"].tolist() == ["MSFT"]
+    assert by_ticker.empty
+
+
 def test_resolve_detail_symbol_from_click_uses_selected_row():
     table = pd.DataFrame({"Ticker": ["AAPL", "MSFT", "NVDA"], "Dettaglio": ["Dettaglio"] * 3})
 

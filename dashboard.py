@@ -21,7 +21,7 @@ import streamlit as st
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, QueryOrderStatus
-from alpaca.trading.requests import GetAssetsRequest, GetOrdersRequest
+from alpaca.trading.requests import GetAssetsRequest, GetOrdersRequest, GetPortfolioHistoryRequest
 
 
 BOT_DIR = Path(__file__).resolve().parent
@@ -914,15 +914,61 @@ def rsi_label(rsi: float, params: StrategyParams = PARAMS) -> str:
     return f":{color}[RSI **{rsi:.1f}**]"
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_portfolio_history(_client, credential_scope: str):
+    request = GetPortfolioHistoryRequest(period="all", timeframe="1D")
+    return _client.get_portfolio_history(history_filter=request)
+
+
+def build_portfolio_history_frame(history) -> tuple[pd.DataFrame, float | None]:
+    timestamps = getattr(history, "timestamp", [])
+    equity_values = getattr(history, "equity", [])
+    base_value = _number_or_nan(getattr(history, "base_value", None))
+    if not timestamps or len(timestamps) != len(equity_values):
+        return pd.DataFrame(columns=["Equity"]), base_value if math.isfinite(base_value) else None
+
+    frame = pd.DataFrame({
+        "Timestamp": pd.to_datetime(timestamps, unit="s", utc=True, errors="coerce"),
+        "Equity": pd.to_numeric(equity_values, errors="coerce"),
+    }).dropna()
+    frame = frame.sort_values("Timestamp").set_index("Timestamp")
+    return frame, base_value if math.isfinite(base_value) else None
+
+
+def portfolio_history_chart(history: pd.DataFrame) -> go.Figure:
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(
+        x=history.index,
+        y=history["Equity"],
+        mode="lines",
+        name="Equity",
+        line={"color": "#16834a", "width": 2},
+        fill="tozeroy",
+        fillcolor="rgba(22, 131, 74, 0.10)",
+        hovertemplate="%{x|%d %b %Y}<br>$%{y:,.2f}<extra></extra>",
+    ))
+    figure.update_layout(
+        title="Andamento del capitale",
+        height=280,
+        margin={"l": 10, "r": 20, "t": 45, "b": 10},
+        hovermode="x unified",
+        showlegend=False,
+    )
+    figure.update_yaxes(title_text="Equity (USD)", tickprefix="$", separatethousands=True)
+    figure.update_xaxes(title_text="")
+    return figure
+
+
 def render_header(client, account_error: str | None, equity: float | None, positions: dict) -> None:
-    cols = st.columns(5)
+    cols = st.columns(6)
     bots = sum(bool(on) for on in st.session_state["bot_enabled"].values())
     if client is None or equity is None:
         cols[0].metric("Account Equity", "—")
-        cols[1].metric("Capitale investito", "—")
-        cols[2].metric("Posizioni aperte", "—")
-        cols[3].metric("P&L oggi (non realizzato)", "—")
-        cols[4].metric("Bot attivi", bots)
+        cols[1].metric("Variazione da inizio", "—")
+        cols[2].metric("Capitale investito", "—")
+        cols[3].metric("Posizioni aperte", "—")
+        cols[4].metric("P&L oggi (non realizzato)", "—")
+        cols[5].metric("Bot attivi", bots)
         st.warning(account_error or NO_KEYS_MESSAGE)
         return
     today_pl = 0.0
@@ -940,11 +986,41 @@ def render_header(client, account_error: str | None, equity: float | None, posit
                 cost_basis = entry_price * quantity
         if math.isfinite(cost_basis):
             invested_capital += abs(cost_basis)
+    history_frame = pd.DataFrame(columns=["Equity"])
+    capital_change = None
+    capital_change_pct = None
+    history_error = None
+    try:
+        api_key, secret, _ = _live_credentials()
+        if api_key and secret:
+            credential_scope = hashlib.sha256(f"{api_key}:{secret}".encode()).hexdigest()
+            history = _cached_portfolio_history(client, credential_scope)
+            history_frame, base_value = build_portfolio_history_frame(history)
+            if base_value is not None and base_value > 0:
+                capital_change = equity - base_value
+                capital_change_pct = capital_change / base_value * 100
+    except Exception as exc:
+        history_error = f"Storico del capitale non disponibile: {exc}"
+
     cols[0].metric("Account Equity", f"${equity:,.2f}")
-    cols[1].metric("Capitale investito", f"${invested_capital:,.2f}")
-    cols[2].metric("Posizioni aperte", len(positions))
-    cols[3].metric("P&L oggi (non realizzato)", f"${today_pl:,.2f}", delta=f"{today_pl:,.2f}")
-    cols[4].metric("Bot attivi", bots)
+    cols[1].metric(
+        "Variazione da inizio",
+        f"${capital_change:+,.2f}" if capital_change is not None else "—",
+        delta=f"{capital_change_pct:+.2f}%" if capital_change_pct is not None else None,
+    )
+    cols[2].metric("Capitale investito", f"${invested_capital:,.2f}")
+    cols[3].metric("Posizioni aperte", len(positions))
+    cols[4].metric("P&L oggi (non realizzato)", f"${today_pl:,.2f}", delta=f"{today_pl:,.2f}")
+    cols[5].metric("Bot attivi", bots)
+    if not history_frame.empty:
+        st.plotly_chart(
+            portfolio_history_chart(history_frame),
+            width="stretch",
+            config={"responsive": True, "displaylogo": False},
+            key="account_equity_history",
+        )
+    if history_error:
+        st.caption(history_error)
     if account_error:
         st.warning(account_error)
 
@@ -1297,6 +1373,15 @@ def paginate_market_radar(filtered: pd.DataFrame, page: int, page_size: int) -> 
     return filtered.iloc[start:start + page_size].copy(), page_count
 
 
+def search_market_radar_by_security(radar: pd.DataFrame, query: str) -> pd.DataFrame:
+    query = query.strip()
+    if not query:
+        return radar.copy()
+    security_names = radar.get("SecurityName", pd.Series("", index=radar.index))
+    matches = security_names.fillna("").astype(str).str.contains(query, case=False, regex=False)
+    return radar.loc[matches].copy()
+
+
 def resolve_market_radar_selected_symbol(table: pd.DataFrame, selected_rows) -> str | None:
     if table.empty or not selected_rows:
         return None
@@ -1383,7 +1468,7 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     st.session_state["market_radar_visible_symbols"] = []
     search_col, sector_col, type_col = st.columns([1.6, 1.4, 1.2])
     selected_symbols = []
-    search_query = search_col.text_input("Cerca nel radar", key="radar_search")
+    search_query = search_col.text_input("Cerca Security", key="radar_search")
     radar_path = resolve_market_radar_path(BOT_DIR / "market_radar.csv")
 
     if st.session_state.pop("nasdaq_sync_message", None):
@@ -1501,8 +1586,7 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     filtered = filter_market_radar(
         radar, selected_sectors, selected_types, scalper_only, trend_only
     )
-    if search_query.strip():
-        filtered = filtered[filtered["Symbol"].astype(str).str.contains(search_query.strip(), case=False, regex=False)]
+    filtered = search_market_radar_by_security(filtered, search_query)
     filtered = filtered.sort_values(sort_by, ascending=not descending, na_position="last", kind="stable")
     if filtered.empty:
         st.info("Nessun ticker corrisponde ai filtri selezionati.")

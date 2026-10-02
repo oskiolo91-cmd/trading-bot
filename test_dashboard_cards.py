@@ -149,6 +149,22 @@ def test_manual_trailing_percentage_overrides_profile_and_drives_dynamic_stop():
     assert round(table.loc[0, "Stop Dinamico ($)"], 2) == 114.36
 
 
+def test_portfolio_history_frame_and_chart_use_equity_points():
+    history = SimpleNamespace(
+        timestamp=[1_780_300_800, 1_780_387_200],
+        equity=[100_000.0, 102_500.0],
+        base_value=100_000.0,
+    )
+
+    frame, base_value = dashboard.build_portfolio_history_frame(history)
+    chart = dashboard.portfolio_history_chart(frame)
+
+    assert len(frame) == 2
+    assert base_value == 100_000.0
+    assert frame["Equity"].iloc[-1] - base_value == 2_500.0
+    assert list(chart.data[0].y) == [100_000.0, 102_500.0]
+
+
 def test_watchlist_can_raise_but_not_lower_bot_high_water_mark():
     position = dashboard.Position(
         entry_date=pd.Timestamp("2026-01-01"),
