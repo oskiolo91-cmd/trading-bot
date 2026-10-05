@@ -226,12 +226,17 @@ def persist_symbol_settings(state: dict, symbol: str) -> None:
     record = {
         "profile": state.get("profile", {}).get(symbol, DEFAULT_PROFILE),
         "custom_trailing_pct": state.get("trailing_stop_pct", {}).get(symbol),
+        "bot_enabled": bool(state.get("bot_enabled", {}).get(symbol, False)),
+        "active_ticker": symbol in state.get("active_tickers", []),
         "custom_settings": {
             key: float(state[f"{key}_{symbol}"])
             for key in custom_keys
             if f"{key}_{symbol}" in state
         },
     }
+    entry_override = state.get("bot_entry_price_overrides", {}).get(symbol)
+    if entry_override is not None:
+        record["custom_settings"]["bot_entry_price_override"] = float(entry_override)
     symbol_state = state.get("bot_state", {}).get(symbol, {})
     managed_position = symbol_state.get("position", symbol_state.get("base"))
     if isinstance(managed_position, Position):
@@ -817,8 +822,15 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
                 saved_override = float("nan")
             if math.isfinite(saved_override) and 0 < saved_override < 1:
                 state.setdefault("trailing_stop_pct", {})[symbol] = saved_override
-        for key, value in persisted.get("custom_settings", {}).items():
-            state[f"{key}_{symbol}"] = value
+        saved_custom_settings = persisted.get("custom_settings", {})
+        saved_entry_override = saved_custom_settings.get("bot_entry_price_override")
+        if saved_entry_override is None:
+            state.get("bot_entry_price_overrides", {}).pop(symbol, None)
+        else:
+            state.setdefault("bot_entry_price_overrides", {})[symbol] = saved_entry_override
+        for key, value in saved_custom_settings.items():
+            if key != "bot_entry_price_override":
+                state[f"{key}_{symbol}"] = value
         saved_buy_date = persisted.get("last_buy_date")
         if symbol not in last_buy and saved_buy_date:
             try:
@@ -889,6 +901,7 @@ def init_state() -> None:
         "bot_enabled": {},
         "active_tickers": [],
         "live_data": {}, "bot_log": [], "bot_state": {}, "bot_last_buy": {}, "bot_high_water_marks": {},
+        "bot_entry_price_overrides": {},
         "panels": {}, "panel_msg": {}, "bot_notice": {}, "auto_refresh": True,
         "profile": {},
         "backtest_open": {},
@@ -902,6 +915,12 @@ def init_state() -> None:
         for symbol, record in persisted_symbols.items():
             if not isinstance(record, dict):
                 continue
+            bot_enabled = bool(record.get("bot_enabled", False))
+            st.session_state["bot_enabled"][symbol] = bot_enabled
+            if bot_enabled or bool(record.get("active_ticker", False)):
+                st.session_state["active_tickers"] = sorted(
+                    set(st.session_state["active_tickers"]) | {symbol}
+                )
             profile = record.get("profile")
             if profile in PROFILE_NAMES:
                 st.session_state["profile"][symbol] = profile
@@ -913,7 +932,10 @@ def init_state() -> None:
             if custom_trailing is not None and math.isfinite(custom_trailing) and 0 < custom_trailing < 1:
                 st.session_state.setdefault("trailing_stop_pct", {})[symbol] = custom_trailing
             for key, value in record.get("custom_settings", {}).items():
-                st.session_state[f"{key}_{symbol}"] = value
+                if key == "bot_entry_price_override":
+                    st.session_state["bot_entry_price_overrides"][symbol] = value
+                else:
+                    st.session_state[f"{key}_{symbol}"] = value
             try:
                 saved_hwm = float(record.get("high_water_mark"))
             except (TypeError, ValueError):
@@ -946,14 +968,19 @@ def _on_toggle(symbol: str) -> None:
 
 
 def set_ticker_bot_enabled(state: dict, symbol: str, enabled: bool) -> None:
-    state.setdefault("bot_enabled", {})[symbol] = bool(enabled)
+    enabled = bool(enabled)
+    was_enabled = bool(state.setdefault("bot_enabled", {}).get(symbol, False))
+    state["bot_enabled"][symbol] = enabled
     active_tickers = set(state.get("active_tickers", []))
+    was_active = symbol in active_tickers
     if enabled:
         active_tickers.add(symbol)
         state.setdefault("profile", {}).setdefault(symbol, DEFAULT_PROFILE)
     else:
         active_tickers.discard(symbol)
     state["active_tickers"] = sorted(active_tickers)
+    if state is st.session_state and (was_enabled != enabled or was_active != (symbol in active_tickers)):
+        persist_symbol_settings(state, symbol)
 
 
 def _on_profile_change(symbol: str, client=None) -> None:
@@ -1064,11 +1091,8 @@ def _on_kill_symbol(client, symbol: str) -> None:
     alpaca_symbol = to_alpaca_symbol(symbol)
     try:
         close_symbol_position(client, alpaca_symbol)
-        st.session_state["bot_enabled"][symbol] = False
+        set_ticker_bot_enabled(st.session_state, symbol, False)
         st.session_state["bot_state"].pop(symbol, None)
-        st.session_state["active_tickers"] = [
-            ticker for ticker in st.session_state.get("active_tickers", []) if ticker != symbol
-        ]
         add_log(st.session_state, f"🛑 {symbol}: KILL SIMBOLO, ordini annullati e posizione chiusa")
     except Exception as exc:
         add_log(st.session_state, f"🛑 {symbol}: KILL SIMBOLO fallito: {exc}")
@@ -1627,6 +1651,7 @@ def render_market_radar_detail(row: pd.Series, symbol: str) -> None:
         ):
             active_tickers.add(symbol)
             st.session_state["active_tickers"] = sorted(active_tickers)
+            update_symbol_state(symbol, {"active_ticker": True})
             st.success(f"{symbol} aggiunto ai Bot Attivi.")
 
 
@@ -1826,6 +1851,7 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
         edited,
         positions,
         st.session_state["bot_enabled"],
+        persist_changes=True,
     )
     if updated_active != set(st.session_state.get("active_tickers", [])):
         st.session_state["active_tickers"] = sorted(updated_active)
@@ -1888,11 +1914,14 @@ def sync_market_editor_selection(
     edited: pd.DataFrame,
     positions: dict,
     bot_enabled: dict[str, bool],
+    persist_changes: bool = False,
 ) -> set[str]:
     updated = merge_market_editor_selection(active_tickers, visible_symbols, edited)
     open_symbols = {_display_symbol(symbol) for symbol in positions}
     for _, row in edited.iterrows():
         symbol = str(row["Symbol"])
+        was_enabled = bool(bot_enabled.get(symbol, False))
+        was_active = symbol in active_tickers
         checked = _radar_bool(row["Attiva Bot"])
         if checked:
             bot_enabled[symbol] = True
@@ -1901,6 +1930,14 @@ def sync_market_editor_selection(
             updated.add(symbol)
         else:
             bot_enabled[symbol] = False
+        if persist_changes and (
+            was_enabled != bool(bot_enabled[symbol])
+            or was_active != (symbol in updated)
+        ):
+            update_symbol_state(symbol, {
+                "bot_enabled": bool(bot_enabled[symbol]),
+                "active_ticker": symbol in updated,
+            })
     return updated
 
 
@@ -2081,7 +2118,7 @@ def main() -> None:
         edited_personal = edited_personal.copy()
         for _, row in edited_personal.iterrows():
             symbol = str(row["Ticker"])
-            st.session_state["bot_enabled"][symbol] = bool(row["Bot"])
+            set_ticker_bot_enabled(st.session_state, symbol, bool(row["Bot"]))
             profile = str(row["Profilo di Rischio"])
             previous_profile = st.session_state["profile"].get(symbol, DEFAULT_PROFILE)
             original_row = personal_table.loc[personal_table["Ticker"] == symbol].iloc[0]
@@ -2126,8 +2163,10 @@ def main() -> None:
             if math.isfinite(requested_entry) and requested_entry > 0:
                 if not math.isfinite(original_entry) or not math.isclose(requested_entry, original_entry):
                     entry_overrides[symbol] = requested_entry
+                    persist_symbol_settings(st.session_state, symbol)
             elif not math.isfinite(requested_entry):
-                entry_overrides.pop(symbol, None)
+                if entry_overrides.pop(symbol, None) is not None:
+                    persist_symbol_settings(st.session_state, symbol)
         active_tickers = set(st.session_state.get("active_tickers", []))
         active_tickers = {symbol for symbol in active_tickers if symbol in set(edited_personal["Ticker"].astype(str))} | set(
             edited_personal[edited_personal["Bot"] == True]["Ticker"].astype(str)

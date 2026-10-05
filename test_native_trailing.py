@@ -153,6 +153,8 @@ def test_sqlite_state_round_trips_risk_fields_and_last_buy(tmp_path):
             "high_water_mark": 123.45,
             "last_buy_date": datetime(2026, 10, 2, tzinfo=timezone.utc).date().isoformat(),
             "custom_settings": {"custom_adx": 31.0, "custom_budget": 150.0},
+            "bot_enabled": True,
+            "active_ticker": True,
         },
         path,
     )
@@ -164,11 +166,13 @@ def test_sqlite_state_round_trips_risk_fields_and_last_buy(tmp_path):
     assert record["trailing_pct"] == pytest.approx(0.047)
     assert record["last_buy_date"] == "2026-10-02"
     assert record["custom_settings"] == {"custom_adx": 31.0, "custom_budget": 150.0}
+    assert record["bot_enabled"] is True
+    assert record["active_ticker"] is True
     with sqlite3.connect(path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(tickers_state)")}
     assert columns == {
         "symbol", "profilo_rischio", "custom_trailing_pct", "high_water_mark",
-        "last_buy_date", "custom_settings_json",
+        "last_buy_date", "custom_settings_json", "bot_enabled", "active_ticker",
     }
 
 
@@ -206,6 +210,8 @@ def test_sqlite_migrates_existing_table_and_preserves_rows(tmp_path):
     assert state["profile"] == "⚖️ Bilanciato"
     assert state["high_water_mark"] == 123.45
     assert state["custom_settings"] == {"custom_budget": 150.0}
+    assert state["bot_enabled"] is False
+    assert state["active_ticker"] is False
 
 
 def test_sqlite_connection_uses_ten_second_timeout_and_allows_cross_thread(tmp_path):

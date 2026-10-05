@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, OrderType
 
 import dashboard
+from bot_state import load_bot_state, update_symbol_state
 
 _REPORT_SPEC = importlib.util.spec_from_file_location(
     "institutional_report", Path(__file__).parent / "pages" / "1_📊_Report.py"
@@ -125,6 +126,56 @@ def test_risk_profiles_set_trailing_stop_percentages():
     for profile, trailing_pct in profiles.items():
         params = dashboard.get_ticker_params("SPY", {"profile": {"SPY": profile}})
         assert params.trailing_pct == trailing_pct
+
+
+def test_persist_symbol_settings_includes_bot_and_watchlist_flags(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        dashboard,
+        "update_symbol_state",
+        lambda symbol, updates: captured.update(symbol=symbol, updates=updates),
+    )
+    state = {
+        "bot_enabled": {"SPY": True},
+        "active_tickers": ["SPY"],
+        "profile": {"SPY": "⚖️ Bilanciato"},
+        "trailing_stop_pct": {},
+        "custom_budget_SPY": 125.0,
+    }
+
+    dashboard.persist_symbol_settings(state, "SPY")
+
+    assert captured["symbol"] == "SPY"
+    assert captured["updates"]["bot_enabled"] is True
+    assert captured["updates"]["active_ticker"] is True
+    assert captured["updates"]["custom_settings"] == {"custom_budget": 125.0}
+
+
+def test_enabled_bot_survives_sqlite_reload_and_is_selected(tmp_path, monkeypatch):
+    path = tmp_path / "bot_state.db"
+    monkeypatch.setattr(
+        dashboard,
+        "update_symbol_state",
+        lambda symbol, updates: update_symbol_state(symbol, updates, path),
+    )
+    state = {
+        "bot_enabled": {"AAPL": True},
+        "active_tickers": ["AAPL"],
+        "profile": {"AAPL": "⚖️ Bilanciato"},
+        "trailing_stop_pct": {},
+    }
+
+    dashboard.persist_symbol_settings(state, "AAPL")
+    saved = load_bot_state(path)["symbols"]["AAPL"]
+    bot_enabled = {"AAPL": saved["bot_enabled"]}
+    active_tickers = ["AAPL"] if saved["active_ticker"] else []
+    selected, missing = dashboard.prepare_ticker_selection(
+        ["SPY", "AAPL"], None, {}, bot_enabled, active_tickers
+    )
+
+    assert saved["bot_enabled"] is True
+    assert "AAPL" in selected
+    assert missing == ["AAPL"]
 
 
 def test_watchlist_table_shows_profile_hwm_and_broker_stop():

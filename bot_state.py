@@ -19,6 +19,8 @@ _COLUMNS = (
     "high_water_mark",
     "last_buy_date",
     "custom_settings_json",
+    "bot_enabled",
+    "active_ticker",
 )
 _ALIASES = {
     "profile": "profilo_rischio",
@@ -50,12 +52,18 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             custom_trailing_pct REAL,
             high_water_mark REAL,
             last_buy_date TEXT,
-            custom_settings_json TEXT
+            custom_settings_json TEXT,
+            bot_enabled INTEGER NOT NULL DEFAULT 0,
+            active_ticker INTEGER NOT NULL DEFAULT 0
         )"""
     )
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(tickers_state)")}
     if "custom_settings_json" not in columns:
         connection.execute("ALTER TABLE tickers_state ADD COLUMN custom_settings_json TEXT")
+    if "bot_enabled" not in columns:
+        connection.execute("ALTER TABLE tickers_state ADD COLUMN bot_enabled INTEGER NOT NULL DEFAULT 0")
+    if "active_ticker" not in columns:
+        connection.execute("ALTER TABLE tickers_state ADD COLUMN active_ticker INTEGER NOT NULL DEFAULT 0")
 
 
 def _public_record(row: sqlite3.Row) -> dict:
@@ -75,6 +83,8 @@ def _public_record(row: sqlite3.Row) -> dict:
         "high_water_mark": row["high_water_mark"],
         "last_buy_date": row["last_buy_date"],
         "custom_settings": custom_settings,
+        "bot_enabled": bool(row["bot_enabled"]),
+        "active_ticker": bool(row["active_ticker"]),
     }
     record["trailing_pct"] = record["custom_trailing_pct"]
     if record["trailing_pct"] is None:
@@ -127,6 +137,10 @@ def update_symbol_state(
                 value = json.dumps(value, allow_nan=False, separators=(",", ":"))
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{key} must contain JSON-compatible finite values") from exc
+        elif column in ("bot_enabled", "active_ticker"):
+            if not isinstance(value, bool):
+                raise TypeError(f"{key} must be a boolean")
+            value = int(value)
         elif column in ("custom_trailing_pct", "high_water_mark") and value is not None:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise TypeError(f"{key} must be numeric or None")
