@@ -1761,6 +1761,11 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     quote_types = sorted(radar["QuoteType"].dropna().astype(str).unique())
     selected_sectors = sector_col.multiselect("Settore", sectors, default=sectors, key="radar_sectors")
     selected_types = type_col.multiselect("Tipo", quote_types, default=quote_types, key="radar_types")
+    buy_the_dip_only = st.checkbox(
+        "🎯 Mostra solo titoli sotto la Banda di Bollinger",
+        value=False,
+        key="filter_bb_dip",
+    )
 
     filter_controls = st.columns([1.5, 1.5, 1.2, 1.2, 1])
     scalper_only = filter_controls[0].toggle("Solo segnali Scalper", key="radar_scalper_only")
@@ -1776,7 +1781,8 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     page_size = filter_controls[4].selectbox("Righe", [10, 25, 50, 100], index=1, key="radar_page_size")
 
     filtered = filter_market_radar(
-        radar, selected_sectors, selected_types, scalper_only, trend_only
+        radar, selected_sectors, selected_types, scalper_only, trend_only,
+        buy_the_dip_only=buy_the_dip_only,
     )
     filtered = search_market_radar_by_security(filtered, search_query)
     filtered = filtered.sort_values(sort_by, ascending=not descending, na_position="last", kind="stable")
@@ -1873,6 +1879,7 @@ def filter_market_radar(
     quote_types: list[str],
     scalper_only: bool = False,
     trend_only: bool = False,
+    buy_the_dip_only: bool = False,
 ) -> pd.DataFrame:
     sector_values = radar["Sector"].astype(str)
     quote_type_values = radar["QuoteType"].astype(str)
@@ -1891,6 +1898,10 @@ def filter_market_radar(
         filtered = filtered[filtered["Validatore_Scalper"]]
     if trend_only:
         filtered = filtered[filtered["Validatore_Trend"]]
+    if buy_the_dip_only:
+        current_price = pd.to_numeric(filtered["Close"], errors="coerce")
+        bollinger_lower = pd.to_numeric(filtered["BB_lower"], errors="coerce")
+        filtered = filtered.loc[current_price <= bollinger_lower]
     return filtered
 
 

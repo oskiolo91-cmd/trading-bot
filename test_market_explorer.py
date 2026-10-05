@@ -22,6 +22,37 @@ def test_market_radar_filters_sector_type_and_combined_validators():
     assert filtered["Symbol"].tolist() == ["A"]
 
 
+def test_market_radar_buy_the_dip_filter_combines_with_existing_filters():
+    radar = pd.DataFrame([
+        {
+            "Symbol": "DIP", "Sector": "Tech", "QuoteType": "Equity",
+            "Close": 90.0, "BB_lower": 95.0,
+            "Validatore_Scalper": True, "Validatore_Trend": True,
+        },
+        {
+            "Symbol": "ABOVE", "Sector": "Tech", "QuoteType": "Equity",
+            "Close": 100.0, "BB_lower": 95.0,
+            "Validatore_Scalper": True, "Validatore_Trend": True,
+        },
+        {
+            "Symbol": "OTHER", "Sector": "Energy", "QuoteType": "Equity",
+            "Close": 90.0, "BB_lower": 95.0,
+            "Validatore_Scalper": True, "Validatore_Trend": True,
+        },
+    ])
+
+    filtered = dashboard.filter_market_radar(
+        radar,
+        sectors=["Tech"],
+        quote_types=["Equity"],
+        scalper_only=True,
+        trend_only=True,
+        buy_the_dip_only=True,
+    )
+
+    assert filtered["Symbol"].tolist() == ["DIP"]
+
+
 def test_resolve_market_radar_path_prefers_existing_local_csv(tmp_path):
     existing = tmp_path / "market_radar.csv"
     existing.write_text("Symbol,Sector\nAAPL,Technology\n")
