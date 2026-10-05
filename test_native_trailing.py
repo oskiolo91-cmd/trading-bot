@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import datetime, timezone
+from threading import Thread
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ import pandas as pd
 from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 
 import live_trader
+import bot_state
 from bot_state import get_symbol_state, load_bot_state, update_symbol_state
 
 
@@ -204,3 +206,26 @@ def test_sqlite_migrates_existing_table_and_preserves_rows(tmp_path):
     assert state["profile"] == "⚖️ Bilanciato"
     assert state["high_water_mark"] == 123.45
     assert state["custom_settings"] == {"custom_budget": 150.0}
+
+
+def test_sqlite_connection_uses_ten_second_timeout_and_allows_cross_thread(tmp_path):
+    connection = bot_state._connect(tmp_path / "bot_state.db")
+    result = []
+    errors = []
+
+    def query_from_worker():
+        try:
+            result.append(connection.execute("SELECT 1").fetchone()[0])
+        except Exception as exc:
+            errors.append(exc)
+
+    try:
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 10_000
+        worker = Thread(target=query_from_worker)
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert not errors
+        assert result == [1]
+    finally:
+        connection.close()

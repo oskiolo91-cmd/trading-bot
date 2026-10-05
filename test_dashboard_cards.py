@@ -40,10 +40,13 @@ def test_ticker_batch_requests_ohlcv_once_for_multiple_symbols(monkeypatch):
         return {symbol: frame.copy() for symbol in symbols}
 
     monkeypatch.setattr(dashboard, "fetch_daily_bars", fake_download)
+    dashboard._cached_ticker_batch.clear()
     results = dashboard._fetch_ticker_batch(["SPY", "QQQ", "BRK-B"])
+    cached_results = dashboard._fetch_ticker_batch(["SPY", "QQQ", "BRK-B"])
 
     assert calls == [["SPY", "QQQ", "BRK.B"]]
     assert set(results) == {"SPY", "QQQ", "BRK-B"}
+    assert set(cached_results) == set(results)
     assert len(results["SPY"]["chart_data"]) == 220
     assert pd.notna(results["SPY"]["chart_data"]["SMA_200"].iloc[-1])
 

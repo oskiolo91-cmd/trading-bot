@@ -59,15 +59,17 @@ def _telegram_credentials() -> tuple[str | None, str | None]:
 
 def send_telegram_message(message: str) -> bool:
     """Send a Telegram message; telemetry failures never interrupt trading."""
-    token, chat_id = _telegram_credentials()
-    if not token or not chat_id or not message.strip():
-        return False
-
     try:
+        token, chat_id = _telegram_credentials()
+        if not token or not chat_id:
+            LOG.warning("Telegram telemetry skipped: bot token or chat ID is not configured")
+            return False
+        if not message.strip():
+            return False
         response = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": message},
-            timeout=(3, 10),
+            timeout=3,
         )
         response.raise_for_status()
         payload = response.json()
@@ -75,7 +77,7 @@ def send_telegram_message(message: str) -> bool:
             LOG.warning("Telegram rejected a telemetry message")
             return False
         return True
-    except (requests.RequestException, ValueError, AttributeError):
+    except Exception:
         LOG.warning("Telegram telemetry delivery failed")
         return False
 

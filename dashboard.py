@@ -592,6 +592,21 @@ def fetch_all_tickers(symbols: list, on_progress=None) -> dict:
 
 
 def _fetch_ticker_batch(symbols: list[str]) -> dict[str, dict]:
+    return _cached_ticker_batch(tuple(symbols), _alpaca_cache_scope())
+
+
+def _alpaca_cache_scope() -> str:
+    api_key, secret_key, _ = _live_credentials()
+    return hashlib.sha256(f"{api_key or ''}:{secret_key or ''}".encode()).hexdigest()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_ticker_batch(
+    symbols: tuple[str, ...],
+    credential_scope: str,
+) -> dict[str, dict]:
+    """Fetch one Alpaca OHLCV batch, cached briefly per credential scope."""
+    _ = credential_scope
     alpaca_symbols = [to_alpaca_symbol(symbol) for symbol in symbols]
     try:
         end = datetime.now(timezone.utc)
@@ -613,8 +628,9 @@ def _fetch_ticker_batch(symbols: list[str]) -> dict[str, dict]:
 def start_ticker_refresh(state, symbols: list[str]) -> None:
     executor = get_ticker_executor()
     batches = [symbols[index:index + REFRESH_WORKERS] for index in range(0, len(symbols), REFRESH_WORKERS)]
+    credential_scope = _alpaca_cache_scope()
     state["refresh_jobs"] = {
-        index: executor.submit(_fetch_ticker_batch, batch)
+        index: executor.submit(_cached_ticker_batch, tuple(batch), credential_scope)
         for index, batch in enumerate(batches)
     }
     state["refresh_completed"] = 0

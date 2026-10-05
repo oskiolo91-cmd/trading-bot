@@ -36,9 +36,9 @@ _PROFILE_TRAILING = {
 def _connect(path: str | Path) -> sqlite3.Connection:
     state_path = Path(path)
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(state_path, timeout=30)
+    connection = sqlite3.connect(state_path, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute("PRAGMA busy_timeout = 10000")
     return connection
 
 

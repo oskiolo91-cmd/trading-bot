@@ -22,7 +22,14 @@ def test_send_telegram_message_posts_to_configured_chat(monkeypatch):
     assert telemetry.send_telegram_message("🟢 fill")
     assert captured["url"] == "https://api.telegram.org/bottest-token/sendMessage"
     assert captured["json"] == {"chat_id": "chat-42", "text": "🟢 fill"}
-    assert captured["timeout"] == (3, 10)
+    assert captured["timeout"] == 3
+
+
+def test_missing_telegram_credentials_are_logged_and_non_blocking(monkeypatch, caplog):
+    monkeypatch.setattr(telemetry, "_telegram_credentials", lambda: (None, None))
+
+    assert not telemetry.send_telegram_message("⚠️ test")
+    assert "not configured" in caplog.text
 
 
 def test_send_telegram_message_is_best_effort_when_request_fails(monkeypatch):
