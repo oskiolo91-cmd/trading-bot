@@ -218,9 +218,19 @@ def get_ticker_params(symbol: str, state=None) -> StrategyParams:
 
 def persist_symbol_settings(state: dict, symbol: str) -> None:
     """Persist the currently selected profile, custom risk values, HWM, and daily entry guard."""
+    custom_keys = (
+        "custom_adx", "custom_rsi", "custom_budget", "custom_stop_atr",
+        "custom_take_profit_atr", "custom_trailing_pct", "custom_daily_target",
+        "custom_max_drawdown",
+    )
     record = {
         "profile": state.get("profile", {}).get(symbol, DEFAULT_PROFILE),
         "custom_trailing_pct": state.get("trailing_stop_pct", {}).get(symbol),
+        "custom_settings": {
+            key: float(state[f"{key}_{symbol}"])
+            for key in custom_keys
+            if f"{key}_{symbol}" in state
+        },
     }
     symbol_state = state.get("bot_state", {}).get(symbol, {})
     managed_position = symbol_state.get("position", symbol_state.get("base"))
@@ -791,6 +801,8 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
                 saved_override = float("nan")
             if math.isfinite(saved_override) and 0 < saved_override < 1:
                 state.setdefault("trailing_stop_pct", {})[symbol] = saved_override
+        for key, value in persisted.get("custom_settings", {}).items():
+            state[f"{key}_{symbol}"] = value
         saved_buy_date = persisted.get("last_buy_date")
         if symbol not in last_buy and saved_buy_date:
             try:
@@ -884,6 +896,8 @@ def init_state() -> None:
                 custom_trailing = None
             if custom_trailing is not None and math.isfinite(custom_trailing) and 0 < custom_trailing < 1:
                 st.session_state.setdefault("trailing_stop_pct", {})[symbol] = custom_trailing
+            for key, value in record.get("custom_settings", {}).items():
+                st.session_state[f"{key}_{symbol}"] = value
             try:
                 saved_hwm = float(record.get("high_water_mark"))
             except (TypeError, ValueError):

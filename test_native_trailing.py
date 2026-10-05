@@ -150,6 +150,7 @@ def test_sqlite_state_round_trips_risk_fields_and_last_buy(tmp_path):
             "custom_trailing_pct": 0.047,
             "high_water_mark": 123.45,
             "last_buy_date": datetime(2026, 10, 2, tzinfo=timezone.utc).date().isoformat(),
+            "custom_settings": {"custom_adx": 31.0, "custom_budget": 150.0},
         },
         path,
     )
@@ -160,10 +161,12 @@ def test_sqlite_state_round_trips_risk_fields_and_last_buy(tmp_path):
     assert record["custom_trailing_pct"] == pytest.approx(0.047)
     assert record["trailing_pct"] == pytest.approx(0.047)
     assert record["last_buy_date"] == "2026-10-02"
+    assert record["custom_settings"] == {"custom_adx": 31.0, "custom_budget": 150.0}
     with sqlite3.connect(path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(tickers_state)")}
     assert columns == {
-        "symbol", "profilo_rischio", "custom_trailing_pct", "high_water_mark", "last_buy_date"
+        "symbol", "profilo_rischio", "custom_trailing_pct", "high_water_mark",
+        "last_buy_date", "custom_settings_json",
     }
 
 
@@ -176,3 +179,28 @@ def test_sqlite_state_updates_fields_without_overwriting_others(tmp_path):
     assert state["profile"] == "⚖️ Bilanciato"
     assert state["high_water_mark"] == 123.45
     assert state["last_buy_date"] == "2026-10-02"
+
+
+def test_sqlite_migrates_existing_table_and_preserves_rows(tmp_path):
+    path = tmp_path / "bot_state.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE tickers_state (
+                symbol TEXT PRIMARY KEY,
+                profilo_rischio TEXT,
+                custom_trailing_pct REAL,
+                high_water_mark REAL,
+                last_buy_date TEXT
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO tickers_state VALUES (?, ?, ?, ?, ?)",
+            ("SPY", "⚖️ Bilanciato", 0.047, 123.45, "2026-10-02"),
+        )
+
+    update_symbol_state("SPY", {"custom_settings": {"custom_budget": 150.0}}, path)
+
+    state = get_symbol_state("SPY", path)
+    assert state["profile"] == "⚖️ Bilanciato"
+    assert state["high_water_mark"] == 123.45
+    assert state["custom_settings"] == {"custom_budget": 150.0}

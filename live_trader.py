@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import sys
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -42,6 +43,7 @@ from bot_state import (
 from models import Order, Position, StrategyParams, strategy_params_for_mode
 from pnl_manager import SymbolState
 from signals import entry_limit_price, stop_loss_price
+from telemetry import send_critical_alert, send_telegram_message
 
 EASTERN = ZoneInfo("America/New_York")
 LOG = logging.getLogger(__name__)
@@ -66,6 +68,63 @@ _TRADE_STREAM_LOCK = RLock()
 _TRADE_UPDATE_HANDLERS: dict[str, list[Callable[[TradeUpdate, SymbolState], Awaitable[None]]]] = {}
 _TRAILING_FILL_LOCK = RLock()
 _TRAILING_FILL_EXECUTIONS: set[str] = set()
+_TELEMETRY_LOCK = RLock()
+_TELEMETRY_EXECUTIONS: deque[str] = deque()
+_TELEMETRY_EXECUTION_SET: set[str] = set()
+_TELEMETRY_DEDUP_LIMIT = 10_000
+
+
+def _send_critical_alert_async(source: str, error: BaseException | str) -> None:
+    Thread(
+        target=send_critical_alert,
+        args=(source, error),
+        name="telegram-critical-alert",
+        daemon=True,
+    ).start()
+
+
+def _claim_telemetry_execution(update: TradeUpdate) -> bool:
+    order = update.order
+    execution_id = str(
+        update.execution_id
+        or f"{order.id}:{order.filled_qty}:{update.timestamp.isoformat()}"
+    )
+    key = f"{order.symbol}:{execution_id}"
+    with _TELEMETRY_LOCK:
+        if key in _TELEMETRY_EXECUTION_SET:
+            return False
+        if len(_TELEMETRY_EXECUTIONS) >= _TELEMETRY_DEDUP_LIMIT:
+            _TELEMETRY_EXECUTION_SET.discard(_TELEMETRY_EXECUTIONS.popleft())
+        _TELEMETRY_EXECUTIONS.append(key)
+        _TELEMETRY_EXECUTION_SET.add(key)
+        return True
+
+
+def _send_fill_telemetry(update: TradeUpdate, realized_pnl: float) -> None:
+    order = update.order
+    quantity = float(update.qty or 0)
+    price = float(update.price or 0)
+    if quantity <= 0 or price <= 0:
+        return
+    side = str(getattr(order.side, "value", order.side)).lower()
+    if side == OrderSide.BUY.value:
+        message = (
+            f"🟢 Eseguito BUY su {order.symbol} - Qtà: {quantity:g}, "
+            f"Prezzo: ${price:,.2f}, Controvalore: ${quantity * price:,.2f}"
+        )
+    elif side == OrderSide.SELL.value:
+        order_type = str(getattr(getattr(order, "type", None), "value", getattr(order, "type", ""))).lower()
+        if order_type == OrderType.TRAILING_STOP.value:
+            heading = f"🔴 Scattato Trailing Stop su {order.symbol}"
+        else:
+            heading = f"🔴 Eseguita vendita su {order.symbol}"
+        message = (
+            f"{heading} - Qtà: {quantity:g}, Prezzo: ${price:,.2f}, "
+            f"P&L operazione: ${realized_pnl:+,.2f}"
+        )
+    else:
+        return
+    send_telegram_message(message)
 
 
 def get_alpaca_client() -> TradingClient:
@@ -207,30 +266,39 @@ def get_total_realized_pnl(client: TradingClient, commission_pct: float = 0.001)
     )
 
 
-def apply_trade_update(
+def _apply_trade_update_with_pnl(
     client: TradingClient,
     update: TradeUpdate,
     commission_pct: float = 0.001,
-) -> SymbolState | None:
+) -> tuple[SymbolState | None, float]:
     """Apply new or partial execution events to the matching symbol ledger."""
     event = str(getattr(update.event, "value", update.event)).lower()
     if event not in {"fill", "partial_fill"}:
-        return None
+        return None, 0.0
     order = update.order
     if update.qty is None or update.price is None:
         LOG.warning("Fill update for %s has no incremental quantity or price", order.symbol)
-        return None
+        return None, 0.0
     state = get_symbol_state(client, order.symbol, commission_pct)
     execution_id = update.execution_id or (
         f"{order.id}:{order.filled_qty}:{update.timestamp.isoformat()}"
     )
-    state.record_fill(
+    realized_pnl = state.record_fill(
         order.side,
         update.qty,
         update.price,
         update.timestamp,
         execution_id=str(execution_id),
     )
+    return state, float(realized_pnl)
+
+
+def apply_trade_update(
+    client: TradingClient,
+    update: TradeUpdate,
+    commission_pct: float = 0.001,
+) -> SymbolState | None:
+    state, _ = _apply_trade_update_with_pnl(client, update, commission_pct)
     return state
 
 
@@ -253,8 +321,12 @@ def start_trade_update_stream(
 ) -> None:
     """Hydrate symbol ledgers, then listen for account fill events in one daemon thread."""
     global _TRADE_STREAM, _TRADE_STREAM_THREAD
-    for symbol in symbols:
-        get_symbol_state(client, symbol, commission_pct)
+    try:
+        for symbol in symbols:
+            get_symbol_state(client, symbol, commission_pct)
+    except Exception as exc:
+        _send_critical_alert_async("Inizializzazione stream Alpaca", exc)
+        raise
 
     with _TRADE_STREAM_LOCK:
         if _TRADE_STREAM_THREAD is not None and _TRADE_STREAM_THREAD.is_alive():
@@ -263,18 +335,35 @@ def start_trade_update_stream(
 
         async def handle_update(update: TradeUpdate) -> None:
             try:
-                state = await asyncio.to_thread(apply_trade_update, client, update, commission_pct)
+                state, realized_pnl = await asyncio.to_thread(
+                    _apply_trade_update_with_pnl, client, update, commission_pct
+                )
                 if state is None:
                     return
+                if _claim_telemetry_execution(update):
+                    await asyncio.to_thread(_send_fill_telemetry, update, realized_pnl)
                 with _TRADE_STREAM_LOCK:
                     handlers = tuple(_TRADE_UPDATE_HANDLERS.get(update.order.symbol, ()))
                 for handler in handlers:
                     await handler(update, state)
-            except Exception:
+            except Exception as exc:
                 LOG.exception("Could not apply trade update for %s", update.order.symbol)
+                _send_critical_alert_async(f"Trade update {update.order.symbol}", exc)
 
         stream.subscribe_trade_updates(handle_update)
-        thread = Thread(target=stream.run, name="alpaca-trade-updates", daemon=True)
+
+        def run_stream() -> None:
+            try:
+                stream.run()
+            except Exception as exc:
+                LOG.exception("Alpaca trade-update stream disconnected")
+                _send_critical_alert_async("Disconnessione stream Alpaca", exc)
+            else:
+                _send_critical_alert_async(
+                    "Disconnessione stream Alpaca", "il flusso si è arrestato inaspettatamente"
+                )
+
+        thread = Thread(target=run_stream, name="alpaca-trade-updates", daemon=True)
         _TRADE_STREAM = stream
         _TRADE_STREAM_THREAD = thread
         thread.start()
@@ -668,8 +757,9 @@ class LiveTradingEngine:
             task.result()
         except asyncio.CancelledError:
             pass
-        except Exception:
+        except Exception as exc:
             LOG.exception("WebSocket strategy task failed")
+            _send_critical_alert_async("Task strategico Alpaca", exc)
 
     def _schedule(self, coroutine) -> None:
         task = asyncio.create_task(coroutine)
@@ -692,8 +782,9 @@ class LiveTradingEngine:
                 await attach_trailing_stop_on_fill(self.client, update, self.params.trailing_pct)
                 if state is self.symbol_state:
                     await self._enforce_daily_limits(update.timestamp)
-            except Exception:
+            except Exception as exc:
                 LOG.exception("Could not process %s trade update for %s", update.event, self.symbol)
+                _send_critical_alert_async(f"Trade update {self.symbol}", exc)
 
     def _update_pending_entry_orders(self, update: TradeUpdate) -> None:
         if update.order.side != OrderSide.BUY:
@@ -859,7 +950,15 @@ def run_live_loop(symbol: str | None = None, params: StrategyParams | None = Non
     params = params or strategy_params_for_mode(os.environ.get("BOT_MODE", "TREND_FOLLOWER"))
     engine = LiveTradingEngine(symbol, params)
     engine.start()
-    data_thread = Thread(target=engine.data_stream.run, name=f"alpaca-bars-{symbol}", daemon=True)
+
+    def run_data_stream() -> None:
+        try:
+            engine.data_stream.run()
+        except Exception as exc:
+            LOG.exception("Alpaca market-data stream disconnected for %s", symbol)
+            _send_critical_alert_async(f"Disconnessione dati Alpaca {symbol}", exc)
+
+    data_thread = Thread(target=run_data_stream, name=f"alpaca-bars-{symbol}", daemon=True)
     data_thread.start()
     try:
         data_thread.join()

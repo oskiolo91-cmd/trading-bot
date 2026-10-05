@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import math
 import os
 import sqlite3
@@ -12,8 +13,19 @@ from pathlib import Path
 LOG = logging.getLogger(__name__)
 STATE_PATH = Path(os.environ.get("BOT_STATE_PATH", Path(__file__).resolve().parent / "bot_state.db"))
 
-_COLUMNS = ("profilo_rischio", "custom_trailing_pct", "high_water_mark", "last_buy_date")
-_ALIASES = {"profile": "profilo_rischio", **{column: column for column in _COLUMNS}}
+_COLUMNS = (
+    "profilo_rischio",
+    "custom_trailing_pct",
+    "high_water_mark",
+    "last_buy_date",
+    "custom_settings_json",
+)
+_ALIASES = {
+    "profile": "profilo_rischio",
+    "trailing_pct": "custom_trailing_pct",
+    "custom_settings": "custom_settings_json",
+    **{column: column for column in _COLUMNS},
+}
 _PROFILE_TRAILING = {
     "🐢 Conservativo": 0.03,
     "⚖️ Bilanciato": 0.06,
@@ -37,17 +49,32 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             profilo_rischio TEXT,
             custom_trailing_pct REAL,
             high_water_mark REAL,
-            last_buy_date TEXT
+            last_buy_date TEXT,
+            custom_settings_json TEXT
         )"""
     )
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(tickers_state)")}
+    if "custom_settings_json" not in columns:
+        connection.execute("ALTER TABLE tickers_state ADD COLUMN custom_settings_json TEXT")
 
 
 def _public_record(row: sqlite3.Row) -> dict:
+    custom_settings = {}
+    if row["custom_settings_json"]:
+        try:
+            decoded_settings = json.loads(row["custom_settings_json"])
+            if isinstance(decoded_settings, dict):
+                custom_settings = decoded_settings
+            else:
+                LOG.warning("Ignoring non-object custom settings for %s", row["symbol"])
+        except (json.JSONDecodeError, TypeError):
+            LOG.warning("Ignoring invalid custom settings JSON for %s", row["symbol"])
     record = {
         "profile": row["profilo_rischio"],
         "custom_trailing_pct": row["custom_trailing_pct"],
         "high_water_mark": row["high_water_mark"],
         "last_buy_date": row["last_buy_date"],
+        "custom_settings": custom_settings,
     }
     record["trailing_pct"] = record["custom_trailing_pct"]
     if record["trailing_pct"] is None:
@@ -93,7 +120,14 @@ def update_symbol_state(
         column = _ALIASES.get(key)
         if column is None:
             raise ValueError(f"unsupported bot-state field: {key}")
-        if column in ("custom_trailing_pct", "high_water_mark") and value is not None:
+        if column == "custom_settings_json" and value is not None:
+            if not isinstance(value, dict):
+                raise TypeError(f"{key} must be an object or None")
+            try:
+                value = json.dumps(value, allow_nan=False, separators=(",", ":"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must contain JSON-compatible finite values") from exc
+        elif column in ("custom_trailing_pct", "high_water_mark") and value is not None:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise TypeError(f"{key} must be numeric or None")
             if not math.isfinite(value):

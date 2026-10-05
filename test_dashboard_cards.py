@@ -212,23 +212,54 @@ def test_manual_trailing_percentage_overrides_profile_without_local_stop_calcula
     assert table.loc[0, "Stop broker ($)"] == 114.11
 
 
-def test_report_builds_portfolio_benchmark_and_drawdown_from_history():
-    history = SimpleNamespace(
-        timestamp=[1_780_300_800, 1_780_387_200],
-        equity=[100_000.0, 102_500.0],
-        base_value=100_000.0,
-    )
-
-    frame = report.build_portfolio_history_frame(history)
-    spy_bars = pd.DataFrame({"Close": [500.0, 510.0]}, index=frame.index)
+def test_report_builds_synthetic_equity_benchmark_and_drawdown():
+    fills = [
+        SimpleNamespace(
+            symbol="SPY", side="buy", qty=1, price=100,
+            transaction_time=pd.Timestamp("2026-09-01T14:00:00Z"),
+        ),
+        SimpleNamespace(
+            symbol="SPY", side="sell", qty=1, price=110,
+            transaction_time=pd.Timestamp("2026-09-03T14:00:00Z"),
+        ),
+    ]
+    dates = pd.date_range("2026-09-01 20:00", periods=3, freq="D", tz="UTC")
+    market_bars = {"SPY": pd.DataFrame({"Close": [100.0, 105.0, 110.0]}, index=dates)}
+    frame = report.build_synthetic_equity_history(fills, market_bars)
+    spy_bars = pd.DataFrame({"Close": [495.0, 500.0, 505.0, 510.0]}, index=frame.index)
     comparison = report.build_equity_comparison(frame, spy_bars)
     chart = report.portfolio_figure(comparison)
 
-    assert len(frame) == 2
-    np.testing.assert_allclose(comparison["Portfolio"].iloc[-1], 102.5)
-    np.testing.assert_allclose(comparison["SPY"].iloc[-1], 102.0)
-    np.testing.assert_allclose(list(chart.data[0].y), [100.0, 102.5])
+    assert len(frame) == 4
+    np.testing.assert_allclose(frame["Equity"].iloc[2], 10_004.9)
+    np.testing.assert_allclose(frame["Equity"].iloc[-1], 10_009.79)
+    np.testing.assert_allclose(
+        comparison["Portfolio"].iloc[-1], frame["Equity"].iloc[-1] / frame["Equity"].iloc[0] * 100
+    )
+    np.testing.assert_allclose(comparison["SPY"].iloc[-1], 510 / 495 * 100)
+    np.testing.assert_allclose(list(chart.data[0].y), list(comparison["Portfolio"]))
     np.testing.assert_allclose(report.max_drawdown_pct(pd.Series([100.0, 90.0, 95.0])), 10.0)
+    assert report.sharpe_ratio(frame["Equity"]) is not None
+
+
+def test_synthetic_equity_includes_open_position_unrealized_pnl():
+    fill = SimpleNamespace(
+        symbol="SPY", side="buy", qty=1, price=100,
+        transaction_time=pd.Timestamp("2026-09-01T14:00:00Z"),
+    )
+    bars = {
+        "SPY": pd.DataFrame(
+            {"Close": [101.0]},
+            index=pd.DatetimeIndex([pd.Timestamp("2026-09-01T20:00:00Z")]),
+        )
+    }
+
+    frame = report.build_synthetic_equity_history(
+        [fill], bars, current_unrealized_pnl=7.0,
+        as_of=pd.Timestamp("2026-09-01T20:00:00Z").to_pydatetime(),
+    )
+
+    np.testing.assert_allclose(frame["Equity"].iloc[-1], 10_006.9)
 
 
 def test_report_calculates_realized_outcomes_fifo():
@@ -240,8 +271,10 @@ def test_report_calculates_realized_outcomes_fifo():
 
     outcomes = report.realized_trade_pnls(fills)
 
-    assert outcomes == [10.0, -10.0]
-    assert report.performance_metrics(outcomes) == (50.0, 1.0)
+    np.testing.assert_allclose(outcomes, [9.79, -10.19])
+    win_rate, profit_factor = report.performance_metrics(outcomes)
+    assert win_rate == 50.0
+    np.testing.assert_allclose(profit_factor, 9.79 / 10.19)
 
 
 def test_watchlist_can_raise_but_not_lower_bot_high_water_mark():
