@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing
 import math
 import hashlib
 import os
@@ -24,6 +25,13 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, QueryOrderStatus
 from alpaca.trading.requests import GetAssetsRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderType
+from bot_state import (
+    STATE_PATH as BOT_STATE_DB,
+    connect_db,
+    get_symbol_state as get_persisted_symbol_state,
+    load_bot_state,
+    update_symbol_state,
+)
 
 
 BOT_DIR = Path(__file__).resolve().parent
@@ -31,25 +39,39 @@ if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 
-def resolve_market_radar_path(output_path: str | Path | None = None) -> Path:
-    candidates: list[Path] = []
-    if output_path is not None:
-        requested = Path(output_path)
-        candidates.append(requested)
-        candidates.append(requested.parent / "market_radar.csv")
-    candidates.extend([
-        Path.cwd() / "market_radar.csv",
-        BOT_DIR / "market_radar.csv",
-    ])
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return Path(output_path) if output_path is not None else BOT_DIR / "market_radar.csv"
+def load_market_radar_data(database_path: str | Path = BOT_STATE_DB) -> pd.DataFrame:
+    """Load the screener table and join persisted per-symbol bot flags."""
+    with closing(connect_db(database_path)) as connection:
+        try:
+            radar = pd.read_sql_query("SELECT * FROM market_radar", connection)
+        except pd.errors.DatabaseError:
+            return pd.DataFrame()
+        try:
+            bot_flags = pd.read_sql_query(
+                "SELECT symbol, bot_enabled, active_ticker FROM tickers_state", connection
+            )
+        except pd.errors.DatabaseError:
+            bot_flags = pd.DataFrame(columns=["symbol", "bot_enabled", "active_ticker"])
+
+    if "Symbol" not in radar.columns:
+        return radar
+    if bot_flags.empty:
+        radar["bot_enabled"] = False
+        radar["active_ticker"] = False
+        return radar
+    joined = radar.merge(
+        bot_flags,
+        how="left",
+        left_on="Symbol",
+        right_on="symbol",
+    ).drop(columns="symbol")
+    for column in ("bot_enabled", "active_ticker"):
+        joined[column] = joined[column].fillna(0).astype(bool)
+    return joined
 
 from backtest import BacktestResult, download_daily_bars, prepare_data, run_backtest
 from alpaca_data import fetch_daily_bars
 from models import Position, StrategyParams
-from bot_state import get_symbol_state as get_persisted_symbol_state, load_bot_state, update_symbol_state
 from live_trader import (
     _initial_position, _open_orders, _trailing_stop_orders,
     attach_trailing_stop_on_fill, close_symbol_position, ensure_native_trailing_stop,
@@ -1661,8 +1683,6 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     search_col, sector_col, type_col = st.columns([1.6, 1.4, 1.2])
     selected_symbols = []
     search_query = search_col.text_input("Cerca Security", key="radar_search")
-    radar_path = resolve_market_radar_path(BOT_DIR / "market_radar.csv")
-
     if st.session_state.pop("nasdaq_sync_message", None):
         st.success("Database Nasdaq aggiornato.")
     if st.button("Aggiorna Anagrafica Nasdaq", key="update_nasdaq_security_master"):
@@ -1671,7 +1691,7 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
 
             with st.spinner("Download dati dal Nasdaq in corso..."):
                 update_nasdaq_db()
-                sync_market_radar_metadata(radar_path)
+                sync_market_radar_metadata()
             st.session_state["nasdaq_sync_message"] = True
             st.rerun(scope="app")
         except Exception as exc:
@@ -1686,28 +1706,18 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
                 start_market_radar_worker,
             )
 
-            initialize_market_radar(available_symbols, radar_path)
+            initialize_market_radar(available_symbols)
             key, secret, _ = _live_credentials()
             if key and secret:
                 start_market_radar_worker(
                     available_symbols,
-                    output_path=radar_path,
                     trading_client=trading_client,
                     data_client=StockHistoricalDataClient(key, secret),
                     batch_size=25,
                 )
-            radar_service = get_market_radar_worker_status(radar_path)
+            radar_service = get_market_radar_worker_status()
         except Exception as exc:
             st.warning(f"Bootstrap del radar non riuscito: {exc}")
-
-    if not radar_path.exists():
-        if trading_client is None:
-            st.info("Connessione Alpaca non disponibile. Configura ALPACA_API_KEY e ALPACA_SECRET_KEY nei Secrets dell'app.")
-        elif not available_symbols:
-            st.info("Connessione Alpaca attiva, ma non risultano asset USA attivi, tradabili e frazionabili.")
-        elif radar_service and radar_service.get("error"):
-            st.error(f"Aggiornamento radar non riuscito: {radar_service['error']}")
-        return selected_symbols
 
     status_column, refresh_column = st.columns([4, 1])
     if radar_service:
@@ -1726,7 +1736,6 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
 
                     start_market_radar_worker(
                         available_symbols,
-                        output_path=radar_path,
                         force=True,
                         trading_client=trading_client,
                         data_client=StockHistoricalDataClient(key, secret),
@@ -1734,14 +1743,24 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
                     )
                     st.rerun(scope="app")
         elif state == "complete":
-            status_column.caption("Catalogo aggiornato; dati letti dal CSV locale.")
+            status_column.caption("Catalogo aggiornato; dati letti dal database SQLite.")
     if refresh_column.button("Aggiorna Tabella", key="refresh_market_radar_table"):
         st.rerun(scope="app")
 
     try:
-        radar = pd.read_csv(radar_path)
+        radar = load_market_radar_data()
     except Exception as exc:
-        st.error(f"Impossibile leggere market_radar.csv: {exc}")
+        st.error(f"Impossibile leggere la tabella market_radar: {exc}")
+        return selected_symbols
+    if radar.empty:
+        if trading_client is None:
+            st.info("Connessione Alpaca non disponibile. Configura ALPACA_API_KEY e ALPACA_SECRET_KEY nei Secrets dell'app.")
+        elif not available_symbols:
+            st.info("Connessione Alpaca attiva, ma non risultano asset USA attivi, tradabili e frazionabili.")
+        elif radar_service and radar_service.get("error"):
+            st.error(f"Aggiornamento radar non riuscito: {radar_service['error']}")
+        else:
+            st.info("Il Market Radar non contiene ancora ticker.")
         return selected_symbols
 
     required = {
@@ -1751,7 +1770,7 @@ def render_market_explorer(positions: dict, available_symbols: list[str], tradin
     }
     missing = sorted(required - set(radar.columns))
     if missing:
-        st.error(f"market_radar.csv non contiene: {', '.join(missing)}")
+        st.error(f"La tabella market_radar non contiene: {', '.join(missing)}")
         return selected_symbols
     for column in ("SecurityName", "Industry"):
         if column not in radar.columns:

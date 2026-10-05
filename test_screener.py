@@ -1,15 +1,22 @@
 from datetime import datetime, timezone
+import sqlite3
 
 import numpy as np
 import pandas as pd
 
 import screener
+from bot_state import get_symbol_state, update_symbol_state
 
 
-def _seed_nasdaq_db(radar_path, rows):
-    database_path = radar_path.parent / "nasdaq_screener.csv"
+def _read_table(database_path, table_name):
+    with sqlite3.connect(database_path) as connection:
+        return pd.read_sql_query(f"SELECT * FROM {table_name}", connection)
+
+
+def _seed_nasdaq_db(database_path, rows):
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(database_path, index=False)
+    with sqlite3.connect(database_path) as connection:
+        pd.DataFrame(rows).to_sql("nasdaq_screener", connection, if_exists="replace", index=False)
     return database_path
 
 
@@ -58,9 +65,9 @@ def test_update_nasdaq_db_downloads_and_normalizes_reference_data(tmp_path, monk
         return FakeResponse()
 
     monkeypatch.setattr(screener.requests, "get", fake_get)
-    output = tmp_path / "nasdaq_screener.csv"
+    output = tmp_path / "bot_state.db"
     database = screener.update_nasdaq_db(output)
-    stored = pd.read_csv(output)
+    stored = _read_table(output, "nasdaq_screener")
 
     assert request["url"] == screener.NASDAQ_SCREENER_URL
     assert request["headers"] == screener.NASDAQ_HEADERS
@@ -81,7 +88,7 @@ def test_radar_exports_schema_and_nasdaq_metadata(tmp_path, monkeypatch):
         "Volume": 100_000,
     }, index=dates)
 
-    output = tmp_path / "market_radar.csv"
+    output = tmp_path / "bot_state.db"
     nasdaq_requests = []
 
     class FakeResponse:
@@ -101,6 +108,7 @@ def test_radar_exports_schema_and_nasdaq_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(screener.requests, "get", fake_get)
     data_client = object()
     received_clients = []
+    update_symbol_state("SPY", {"bot_enabled": True, "active_ticker": True}, output)
 
     def fake_fetch_daily_bars(symbols, **kwargs):
         received_clients.append(kwargs.get("client"))
@@ -115,7 +123,7 @@ def test_radar_exports_schema_and_nasdaq_metadata(tmp_path, monkeypatch):
     radar = screener.generate_market_radar(
         ["SPY"], output, trading_client=FakeTradingClient(), data_client=data_client
     )
-    stored = pd.read_csv(output)
+    stored = _read_table(output, "market_radar")
 
     assert output.exists()
     assert list(radar.columns) == screener.RADAR_COLUMNS
@@ -126,6 +134,8 @@ def test_radar_exports_schema_and_nasdaq_metadata(tmp_path, monkeypatch):
     assert stored.loc[0, "Symbol"] == "SPY"
     assert received_clients == [data_client]
     assert len(nasdaq_requests) == 1
+    assert _read_table(output, "nasdaq_screener").loc[0, "symbol"] == "SPY"
+    assert get_symbol_state("SPY", output)["bot_enabled"] is True
 
 
 def test_nasdaq_metadata_lookup_uses_index_and_unknown_fallback():
@@ -147,7 +157,7 @@ def test_nasdaq_metadata_lookup_uses_index_and_unknown_fallback():
 
 
 def test_sync_market_radar_metadata_preserves_financial_fields(tmp_path):
-    output = tmp_path / "market_radar.csv"
+    output = tmp_path / "bot_state.db"
     row = screener._empty_radar_row("AAPL")
     row.update({
         "SecurityName": "Old name", "Sector": "Old sector", "Industry": "Old industry",
@@ -162,7 +172,7 @@ def test_sync_market_radar_metadata_preserves_financial_fields(tmp_path):
     }])
 
     screener.sync_market_radar_metadata(output)
-    stored = pd.read_csv(output).iloc[0]
+    stored = _read_table(output, "market_radar").iloc[0]
 
     assert stored["SecurityName"] == "Apple Inc."
     assert stored["Sector"] == "Technology"
@@ -187,8 +197,9 @@ def test_generate_market_radar_keeps_cached_sector_metadata_on_refresh(tmp_path,
         "Volume": 100_000,
     }, index=dates)
 
-    output = tmp_path / "market_radar.csv"
-    pd.DataFrame([
+    output = tmp_path / "bot_state.db"
+    with sqlite3.connect(output) as connection:
+        pd.DataFrame([
         {
             "Symbol": "AAPL",
             "Sector": "Technology",
@@ -204,7 +215,7 @@ def test_generate_market_radar_keeps_cached_sector_metadata_on_refresh(tmp_path,
             "Validatore_Scalper": True,
             "Validatore_Trend": True,
         }
-    ]).to_csv(output, index=False)
+        ]).to_sql("market_radar", connection, if_exists="replace", index=False)
 
     _seed_nasdaq_db(output, [{
         "symbol": "MSFT", "name": "Microsoft Corporation", "sector": "Technology",
@@ -217,7 +228,7 @@ def test_generate_market_radar_keeps_cached_sector_metadata_on_refresh(tmp_path,
             return type("Clock", (), {"is_open": False})()
 
     screener.generate_market_radar(["AAPL"], output, trading_client=FakeTradingClient(), data_client=object())
-    stored = pd.read_csv(output)
+    stored = _read_table(output, "market_radar")
 
     assert stored.loc[0, "Sector"] == "Technology"
     assert stored.loc[0, "QuoteType"] == "Equity"
@@ -238,7 +249,7 @@ def test_generate_market_radar_creates_missing_output_directory(tmp_path, monkey
         "Volume": 100_000,
     }, index=dates)
 
-    output = tmp_path / "subdir" / "market_radar.csv"
+    output = tmp_path / "subdir" / "bot_state.db"
 
     monkeypatch.setattr(
         screener, "_load_nasdaq_db",
@@ -253,13 +264,12 @@ def test_generate_market_radar_creates_missing_output_directory(tmp_path, monkey
     screener.generate_market_radar(["AAPL"], output, trading_client=FakeTradingClient(), data_client=object())
 
     assert output.exists()
-    stored = pd.read_csv(output)
+    stored = _read_table(output, "market_radar")
     assert stored.loc[0, "Sector"] == "Unknown"
 
 
 def test_initialize_market_radar_bootstraps_and_preserves_existing_data(tmp_path):
-    output = tmp_path / "market_radar.csv"
-    output.write_text("")
+    output = tmp_path / "bot_state.db"
 
     initial = screener.initialize_market_radar(["SPY", "AAPL"], output)
 
@@ -270,7 +280,7 @@ def test_initialize_market_radar_bootstraps_and_preserves_existing_data(tmp_path
 
     initial.loc[initial["Symbol"] == "AAPL", "Sector"] = "Technology"
     initial.loc[initial["Symbol"] == "AAPL", "Close"] = 200.0
-    initial.to_csv(output, index=False)
+    screener._write_market_radar(initial, output)
     updated = screener.initialize_market_radar(["AAPL", "MSFT"], output)
 
     apple = updated.loc[updated["Symbol"] == "AAPL"].iloc[0]
@@ -281,7 +291,7 @@ def test_initialize_market_radar_bootstraps_and_preserves_existing_data(tmp_path
     assert pd.isna(microsoft["Close"])
 
 
-def test_generate_market_radar_writes_progressively_to_csv(monkeypatch, tmp_path):
+def test_generate_market_radar_writes_progressively_to_sqlite(monkeypatch, tmp_path):
     dates = pd.date_range("2025-01-01", periods=220, freq="B", tz="UTC")
     close = pd.Series(np.linspace(100, 120, len(dates)), index=dates)
     frame = pd.DataFrame({
@@ -293,7 +303,7 @@ def test_generate_market_radar_writes_progressively_to_csv(monkeypatch, tmp_path
         "Volume": 100_000,
     }, index=dates)
 
-    output = tmp_path / "progressive_market_radar.csv"
+    output = tmp_path / "bot_state.db"
     calls = []
 
     _seed_nasdaq_db(output, [
@@ -301,7 +311,7 @@ def test_generate_market_radar_writes_progressively_to_csv(monkeypatch, tmp_path
         {"symbol": "MSFT", "name": "Microsoft Corporation", "sector": "Technology", "industry": "Software", "marketCap": 200},
     ])
     def fake_fetch_daily_bars(symbols, **kwargs):
-        bootstrapped = pd.read_csv(output)
+        bootstrapped = _read_table(output, "market_radar")
         assert set(bootstrapped["Symbol"]) == {"AAPL", "MSFT"}
         assert bootstrapped["Close"].isna().all()
         return {symbol: frame for symbol in symbols}
@@ -322,5 +332,33 @@ def test_generate_market_radar_writes_progressively_to_csv(monkeypatch, tmp_path
     )
 
     assert len(calls) >= 2
-    stored = pd.read_csv(output)
+    stored = _read_table(output, "market_radar")
     assert set(stored["Symbol"]) == {"AAPL", "MSFT"}
+
+
+def test_legacy_csv_tables_are_imported_once_into_shared_database(tmp_path, monkeypatch):
+    database_path = tmp_path / "bot_state.db"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    pd.DataFrame([screener._empty_radar_row("SPY")]).to_csv(
+        legacy_dir / "market_radar.csv", index=False
+    )
+    pd.DataFrame([{
+        "symbol": "SPY", "name": "SPDR S&P 500 ETF", "sector": "ETF",
+        "industry": "Large Blend", "marketCap": 500,
+    }]).to_csv(legacy_dir / "nasdaq_screener.csv", index=False)
+    monkeypatch.setattr(screener, "DATABASE_PATH", database_path)
+    monkeypatch.setattr(screener, "LEGACY_DATA_DIR", legacy_dir)
+
+    radar = screener._read_market_radar()
+    nasdaq = screener._load_nasdaq_db()
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+    assert radar["Symbol"].tolist() == ["SPY"]
+    assert nasdaq.loc["SPY", "name"] == "SPDR S&P 500 ETF"
+    assert {"market_radar", "nasdaq_screener"} <= tables

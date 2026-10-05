@@ -1,3 +1,4 @@
+import sqlite3
 import pandas as pd
 from types import SimpleNamespace
 
@@ -53,13 +54,33 @@ def test_market_radar_buy_the_dip_filter_combines_with_existing_filters():
     assert filtered["Symbol"].tolist() == ["DIP"]
 
 
-def test_resolve_market_radar_path_prefers_existing_local_csv(tmp_path):
-    existing = tmp_path / "market_radar.csv"
-    existing.write_text("Symbol,Sector\nAAPL,Technology\n")
+def test_load_market_radar_data_joins_persisted_bot_flags(tmp_path):
+    database_path = tmp_path / "bot_state.db"
+    with sqlite3.connect(database_path) as connection:
+        pd.DataFrame([
+            {"Symbol": "AAPL", "Close": 90.0, "BB_lower": 95.0},
+            {"Symbol": "MSFT", "Close": 100.0, "BB_lower": 95.0},
+        ]).to_sql("market_radar", connection, index=False)
+        connection.execute(
+            """CREATE TABLE tickers_state (
+                symbol TEXT PRIMARY KEY,
+                bot_enabled INTEGER NOT NULL DEFAULT 0,
+                active_ticker INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO tickers_state (symbol, bot_enabled, active_ticker) VALUES (?, ?, ?)",
+            ("AAPL", 1, 1),
+        )
 
-    resolved = dashboard.resolve_market_radar_path(tmp_path / "missing.csv")
+    radar = dashboard.load_market_radar_data(database_path)
+    apple = radar.loc[radar["Symbol"] == "AAPL"].iloc[0]
+    microsoft = radar.loc[radar["Symbol"] == "MSFT"].iloc[0]
 
-    assert resolved == existing
+    assert bool(apple["bot_enabled"]) is True
+    assert bool(apple["active_ticker"]) is True
+    assert bool(microsoft["bot_enabled"]) is False
+    assert bool(microsoft["active_ticker"]) is False
 
 
 def test_market_radar_with_empty_filters_shows_everything():

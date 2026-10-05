@@ -35,13 +35,18 @@ _PROFILE_TRAILING = {
 }
 
 
-def _connect(path: str | Path) -> sqlite3.Connection:
+def connect_db(path: str | Path = STATE_PATH) -> sqlite3.Connection:
+    """Open a SQLite connection to the shared bot-state database."""
     state_path = Path(path)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(state_path, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 10000")
     return connection
+
+
+def _connect(path: str | Path) -> sqlite3.Connection:
+    return connect_db(path)
 
 
 def _ensure_schema(connection: sqlite3.Connection) -> None:

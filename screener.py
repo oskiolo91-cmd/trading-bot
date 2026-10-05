@@ -6,9 +6,9 @@ import asyncio
 import argparse
 import logging
 import math
-import os
-import tempfile
+import sqlite3
 import threading
+from contextlib import closing
 
 import requests
 from datetime import date, datetime, time, timedelta, timezone
@@ -21,12 +21,13 @@ import pandas as pd
 from alpaca_data import fetch_daily_bars
 from backtest import download_daily_bars, load_ohlcv_csv, prepare_data
 from macro_filter import has_risk_off_within
+from bot_state import STATE_PATH, connect_db
 
 LOG = logging.getLogger(__name__)
-# The local CSV is treated as a lightweight database: the dashboard reads it immediately and the
-# background worker updates it asynchronously as data is fetched for each ticker.
-MARKET_RADAR_PATH = Path(__file__).resolve().with_name("market_radar.csv")
-NASDAQ_DB_PATH = Path(__file__).resolve().with_name("nasdaq_screener.csv")
+DATABASE_PATH = STATE_PATH
+LEGACY_DATA_DIR = Path(__file__).resolve().parent
+MARKET_RADAR_TABLE = "market_radar"
+NASDAQ_SCREENER_TABLE = "nasdaq_screener"
 NASDAQ_SCREENER_URL = (
     "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=25&offset=0&download=true"
 )
@@ -66,30 +67,57 @@ def _empty_radar_row(symbol: str) -> dict[str, Any]:
     }
 
 
-def _write_market_radar(frame: pd.DataFrame, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def resolve_database_path(database_path: str | Path | None = None) -> Path:
+    return Path(database_path) if database_path is not None else DATABASE_PATH
+
+
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _migrate_legacy_csv(table_name: str, filename: str, database_path: Path) -> None:
+    """Import a legacy CSV once, only when its SQLite table has not been created."""
+    if database_path.resolve() != DATABASE_PATH.resolve():
+        return
+    with _RADAR_FILE_LOCK:
+        with closing(connect_db(database_path)) as connection:
+            if _table_exists(connection, table_name):
+                return
+        legacy_path = LEGACY_DATA_DIR / filename
+        if not legacy_path.exists():
+            return
+        try:
+            frame = pd.read_csv(legacy_path)
+            with closing(connect_db(database_path)) as connection:
+                with connection:
+                    if not _table_exists(connection, table_name):
+                        frame.to_sql(table_name, connection, if_exists="fail", index=False)
+            LOG.info("Imported legacy %s into SQLite table %s", filename, table_name)
+        except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, sqlite3.Error):
+            LOG.exception("Could not migrate legacy CSV %s", legacy_path)
+
+
+def _write_market_radar(frame: pd.DataFrame, output_path: str | Path | None = None) -> None:
     normalized = frame.reindex(columns=RADAR_COLUMNS)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", newline="", suffix=".csv",
-            prefix=f".{output_path.name}.", dir=output_path.parent, delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            normalized.to_csv(temporary_file, index=False)
-        os.replace(temporary_path, output_path)
-    finally:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
+    with closing(connect_db(resolve_database_path(output_path))) as connection:
+        with connection:
+            normalized.to_sql(MARKET_RADAR_TABLE, connection, if_exists="replace", index=False)
 
 
-def _read_market_radar(output_path: Path) -> pd.DataFrame:
-    if not output_path.exists():
-        return pd.DataFrame(columns=RADAR_COLUMNS)
+def _read_market_radar(output_path: str | Path | None = None) -> pd.DataFrame:
+    database_path = resolve_database_path(output_path)
+    _migrate_legacy_csv(MARKET_RADAR_TABLE, "market_radar.csv", database_path)
     try:
-        frame = pd.read_csv(output_path)
-    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
-        LOG.exception("Could not read market radar CSV at %s", output_path)
+        with closing(connect_db(database_path)) as connection:
+            if not _table_exists(connection, MARKET_RADAR_TABLE):
+                return pd.DataFrame(columns=RADAR_COLUMNS)
+            frame = pd.read_sql_query(f"SELECT * FROM {MARKET_RADAR_TABLE}", connection)
+    except (OSError, sqlite3.Error, pd.errors.DatabaseError):
+        LOG.exception("Could not read market radar from SQLite")
         return pd.DataFrame(columns=RADAR_COLUMNS)
     for column in RADAR_COLUMNS:
         if column not in frame.columns:
@@ -105,17 +133,15 @@ def initialize_market_radar(
     symbols: list[str], output_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """Persist catalog rows immediately, retaining any existing metadata and financial data."""
-    path = resolve_market_radar_path(output_path)
+    path = resolve_database_path(output_path)
     catalog = list(dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip()))
     with _RADAR_FILE_LOCK:
         current = _read_market_radar(path)
         existing_symbols = set(current["Symbol"].astype(str)) if not current.empty else set()
         missing_rows = [_empty_radar_row(symbol) for symbol in catalog if symbol not in existing_symbols]
-        try:
-            existing_columns = pd.read_csv(path, nrows=0).columns.tolist() if path.exists() else []
-        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
-            existing_columns = []
-        if missing_rows or existing_columns != RADAR_COLUMNS:
+        with closing(connect_db(path)) as connection:
+            table_exists = _table_exists(connection, MARKET_RADAR_TABLE)
+        if missing_rows or not table_exists:
             initialized = pd.concat([current, pd.DataFrame(missing_rows, columns=RADAR_COLUMNS)], ignore_index=True)
             _write_market_radar(initialized, path)
             current = initialized
@@ -123,14 +149,11 @@ def initialize_market_radar(
 
 
 def resolve_nasdaq_db_path(output_path: str | Path | None = None) -> Path:
-    if output_path is not None:
-        return Path(output_path).parent / "nasdaq_screener.csv"
-    return NASDAQ_DB_PATH
+    return resolve_database_path(output_path)
 
 
 def update_nasdaq_db(output_path: str | Path | None = None) -> pd.DataFrame:
-    """Download and atomically persist Nasdaq's public stock screener reference data."""
-    path = Path(output_path) if output_path is not None else NASDAQ_DB_PATH
+    """Download and persist Nasdaq's public stock reference data in SQLite."""
     response = requests.get(NASDAQ_SCREENER_URL, headers=NASDAQ_HEADERS, timeout=30)
     response.raise_for_status()
     rows = response.json()["data"]["rows"]
@@ -153,27 +176,21 @@ def update_nasdaq_db(output_path: str | Path | None = None) -> pd.DataFrame:
     if frame.empty:
         raise ValueError("Nasdaq response contained no usable symbols")
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", newline="", suffix=".csv",
-            prefix=f".{path.name}.", dir=path.parent, delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            frame.to_csv(temporary_file, index=False)
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
+    with closing(connect_db(resolve_nasdaq_db_path(output_path))) as connection:
+        with connection:
+            frame.to_sql(NASDAQ_SCREENER_TABLE, connection, if_exists="replace", index=False)
     return frame
 
 
 def _load_nasdaq_db(output_path: str | Path | None = None) -> pd.DataFrame:
     path = resolve_nasdaq_db_path(output_path)
-    if not path.exists():
+    _migrate_legacy_csv(NASDAQ_SCREENER_TABLE, "nasdaq_screener.csv", path)
+    with closing(connect_db(path)) as connection:
+        table_exists = _table_exists(connection, NASDAQ_SCREENER_TABLE)
+    if not table_exists:
         update_nasdaq_db(path)
-    frame = pd.read_csv(path)
+    with closing(connect_db(path)) as connection:
+        frame = pd.read_sql_query(f"SELECT * FROM {NASDAQ_SCREENER_TABLE}", connection)
     if "symbol" not in frame.columns:
         raise ValueError(f"Nasdaq database has no symbol column: {path}")
     frame["symbol"] = frame["symbol"].fillna("").astype(str).str.strip().str.upper().str.replace(".", "-", regex=False)
@@ -210,9 +227,9 @@ def _upsert_market_radar_rows(rows: list[dict[str, Any]], output_path: Path) -> 
     with _RADAR_FILE_LOCK:
         current = _read_market_radar(output_path)
         if not current.empty:
-            current = current.set_index("Symbol")
+            current = current.set_index("Symbol").astype(object)
         else:
-            current = pd.DataFrame(columns=RADAR_COLUMNS).set_index("Symbol")
+            current = pd.DataFrame(columns=RADAR_COLUMNS).set_index("Symbol").astype(object)
         for row in rows:
             symbol = str(row["Symbol"])
             if symbol not in current.index:
@@ -230,7 +247,7 @@ def _upsert_market_radar_rows(rows: list[dict[str, Any]], output_path: Path) -> 
 
 
 def get_market_radar_worker_status(output_path: str | Path | None = None) -> dict[str, Any]:
-    path = str(resolve_market_radar_path(output_path).resolve())
+    path = str(resolve_database_path(output_path).resolve())
     with _RADAR_WORKER_LOCK:
         return dict(_RADAR_WORKER_STATUS.get(path, {"state": "idle", "completed": 0, "total": 0, "error": None}))
 
@@ -241,8 +258,8 @@ def start_market_radar_worker(
     force: bool = False,
     **generation_options,
 ) -> bool:
-    """Start one daemon worker per CSV path; safe to call on every Streamlit rerun."""
-    path = resolve_market_radar_path(output_path)
+    """Start one daemon worker per SQLite database; safe on every Streamlit rerun."""
+    path = resolve_database_path(output_path)
     key = str(path.resolve())
     catalog = list(dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip()))
     if not catalog:
@@ -292,19 +309,8 @@ def start_market_radar_worker(
 
 
 def resolve_market_radar_path(output_path: str | Path | None = None) -> Path:
-    candidates: list[Path] = []
-    if output_path is not None:
-        requested = Path(output_path)
-        candidates.append(requested)
-        candidates.append(requested.parent / "market_radar.csv")
-    candidates.extend([
-        Path.cwd() / "market_radar.csv",
-        MARKET_RADAR_PATH,
-    ])
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return Path(output_path) if output_path is not None else MARKET_RADAR_PATH
+    """Compatibility wrapper returning the SQLite database path, not a CSV path."""
+    return resolve_database_path(output_path)
 
 
 def evaluate_asset(csv_path, min_avg_volume=1_000_000, lookback=20, adx_max=25.0, min_lateral_ratio=0.5, min_atr_pct=0.005):
@@ -418,8 +424,8 @@ def _radar_row(symbol: str, bars: pd.DataFrame, metadata: dict[str, Any]) -> dic
 
 
 def sync_market_radar_metadata(output_path: str | Path | None = None) -> None:
-    """Apply the local Nasdaq master to existing radar rows without changing financial fields."""
-    radar_path = resolve_market_radar_path(output_path)
+    """Apply the SQLite Nasdaq master to radar rows without changing financial fields."""
+    radar_path = resolve_database_path(output_path)
     try:
         nasdaq_db = _load_nasdaq_db(radar_path)
     except Exception:
@@ -450,8 +456,8 @@ def generate_market_radar(
     progress_callback=None,
     batch_size: int = 50,
 ) -> pd.DataFrame:
-    """Enrich the bootstrapped local catalog in small, durable chunks."""
-    output_path = resolve_market_radar_path(output_path)
+    """Enrich the SQLite catalog in small, durable chunks."""
+    output_path = resolve_database_path(output_path)
     symbols = list(dict.fromkeys(symbols if symbols is not None else load_index_universe()))
     if not symbols:
         raise ValueError("At least one ticker is required")
@@ -521,9 +527,9 @@ def generate_market_radar(
 
 
 def main(argv=None) -> pd.DataFrame:
-    parser = argparse.ArgumentParser(description="Build the Alpaca/Nasdaq market radar CSV")
+    parser = argparse.ArgumentParser(description="Build the Alpaca/Nasdaq market radar in SQLite")
     parser.add_argument("--symbols", help="Comma-separated symbols; defaults to S&P 500 + Nasdaq 100")
-    parser.add_argument("--output", default=str(MARKET_RADAR_PATH))
+    parser.add_argument("--output", default=str(DATABASE_PATH), help="SQLite database path")
     args = parser.parse_args(argv)
     symbols = [symbol.strip().upper() for symbol in args.symbols.split(",") if symbol.strip()] if args.symbols else None
     return generate_market_radar(symbols=symbols, output_path=args.output)
