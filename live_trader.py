@@ -123,7 +123,7 @@ def _parse_trade_fill(payload: Mapping) -> TradeFill:
     return TradeFill(str(activity_id), symbol, side, quantity, price, timestamp)
 
 
-def _get_trade_activities(client: TradingClient) -> list[TradeFill]:
+def get_trade_activities(client: TradingClient) -> list[TradeFill]:
     now = datetime.now(timezone.utc)
     cached = _ACTIVITY_CACHE.get(id(client))
     if cached and now - cached[0] < timedelta(seconds=30):
@@ -154,6 +154,9 @@ def _get_trade_activities(client: TradingClient) -> list[TradeFill]:
     return activities
 
 
+_get_trade_activities = get_trade_activities
+
+
 def get_symbol_daily_pnl(
     client: TradingClient,
     symbol: str,
@@ -177,7 +180,7 @@ def get_symbol_state(
             return state
         state = SymbolState(symbol, commission_pct=commission_pct, timezone_=EASTERN)
         activities = sorted(
-            (activity for activity in _get_trade_activities(client) if activity.symbol == symbol),
+            (activity for activity in get_trade_activities(client) if activity.symbol == symbol),
             key=lambda activity: activity.transaction_time,
         )
         for activity in activities:
@@ -197,7 +200,7 @@ def get_symbol_state(
 
 def get_total_realized_pnl(client: TradingClient, commission_pct: float = 0.001) -> float:
     """Replay fills through the FIFO ledgers and return account-wide realized P&L."""
-    symbols = {activity.symbol for activity in _get_trade_activities(client)}
+    symbols = {activity.symbol for activity in get_trade_activities(client)}
     return sum(
         float(get_symbol_state(client, symbol, commission_pct).realized_pnl)
         for symbol in symbols

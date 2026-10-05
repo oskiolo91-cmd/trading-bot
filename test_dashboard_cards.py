@@ -1,10 +1,18 @@
+import importlib.util
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from uuid import uuid4
 from types import SimpleNamespace
 from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, OrderType
 
 import dashboard
+
+_REPORT_SPEC = importlib.util.spec_from_file_location(
+    "institutional_report", Path(__file__).parent / "pages" / "1_📊_Report.py"
+)
+report = importlib.util.module_from_spec(_REPORT_SPEC)
+_REPORT_SPEC.loader.exec_module(report)
 
 
 def _daily_frame() -> pd.DataFrame:
@@ -204,20 +212,36 @@ def test_manual_trailing_percentage_overrides_profile_without_local_stop_calcula
     assert table.loc[0, "Stop broker ($)"] == 114.11
 
 
-def test_portfolio_history_frame_and_chart_use_equity_points():
+def test_report_builds_portfolio_benchmark_and_drawdown_from_history():
     history = SimpleNamespace(
         timestamp=[1_780_300_800, 1_780_387_200],
         equity=[100_000.0, 102_500.0],
         base_value=100_000.0,
     )
 
-    frame, base_value = dashboard.build_portfolio_history_frame(history)
-    chart = dashboard.portfolio_history_chart(frame)
+    frame = report.build_portfolio_history_frame(history)
+    spy_bars = pd.DataFrame({"Close": [500.0, 510.0]}, index=frame.index)
+    comparison = report.build_equity_comparison(frame, spy_bars)
+    chart = report.portfolio_figure(comparison)
 
     assert len(frame) == 2
-    assert base_value == 100_000.0
-    assert frame["Equity"].iloc[-1] - base_value == 2_500.0
-    assert list(chart.data[0].y) == [100_000.0, 102_500.0]
+    np.testing.assert_allclose(comparison["Portfolio"].iloc[-1], 102.5)
+    np.testing.assert_allclose(comparison["SPY"].iloc[-1], 102.0)
+    np.testing.assert_allclose(list(chart.data[0].y), [100.0, 102.5])
+    np.testing.assert_allclose(report.max_drawdown_pct(pd.Series([100.0, 90.0, 95.0])), 10.0)
+
+
+def test_report_calculates_realized_outcomes_fifo():
+    fills = [
+        SimpleNamespace(symbol="SPY", side="buy", qty=2, price=100, transaction_time=pd.Timestamp("2026-09-01")),
+        SimpleNamespace(symbol="SPY", side="sell", qty=1, price=110, transaction_time=pd.Timestamp("2026-09-02")),
+        SimpleNamespace(symbol="SPY", side="sell", qty=1, price=90, transaction_time=pd.Timestamp("2026-09-03")),
+    ]
+
+    outcomes = report.realized_trade_pnls(fills)
+
+    assert outcomes == [10.0, -10.0]
+    assert report.performance_metrics(outcomes) == (50.0, 1.0)
 
 
 def test_watchlist_can_raise_but_not_lower_bot_high_water_mark():

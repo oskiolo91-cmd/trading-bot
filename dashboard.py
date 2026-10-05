@@ -22,7 +22,7 @@ import streamlit as st
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, QueryOrderStatus
-from alpaca.trading.requests import GetAssetsRequest, GetOrdersRequest, GetPortfolioHistoryRequest
+from alpaca.trading.requests import GetAssetsRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderType
 
 
@@ -53,7 +53,7 @@ from bot_state import get_symbol_state as get_persisted_symbol_state, load_bot_s
 from live_trader import (
     _initial_position, _open_orders, _trailing_stop_orders,
     attach_trailing_stop_on_fill, close_symbol_position, ensure_native_trailing_stop,
-    get_account_value, get_alpaca_client, get_symbol_daily_pnl, get_total_realized_pnl,
+    get_account_value, get_alpaca_client, get_symbol_daily_pnl,
     get_latest_bars, get_recent_orders, place_limit_buy, place_market_sell,
     register_trade_update_handler, replace_trailing_stop_percent, run_signal_check,
     start_trade_update_stream, whole_share_quantity,
@@ -218,22 +218,9 @@ def get_ticker_params(symbol: str, state=None) -> StrategyParams:
 
 def persist_symbol_settings(state: dict, symbol: str) -> None:
     """Persist the currently selected profile, custom risk values, HWM, and daily entry guard."""
-    params = get_ticker_params(symbol, state)
-    custom_keys = (
-        "custom_adx", "custom_rsi", "custom_budget", "custom_stop_atr",
-        "custom_take_profit_atr", "custom_trailing_pct", "custom_daily_target",
-        "custom_max_drawdown",
-    )
-    custom_settings = {
-        key: float(state[f"{key}_{symbol}"])
-        for key in custom_keys
-        if f"{key}_{symbol}" in state
-    }
     record = {
         "profile": state.get("profile", {}).get(symbol, DEFAULT_PROFILE),
-        "trailing_pct": float(params.trailing_pct),
         "custom_trailing_pct": state.get("trailing_stop_pct", {}).get(symbol),
-        "custom_settings": custom_settings,
     }
     symbol_state = state.get("bot_state", {}).get(symbol, {})
     managed_position = symbol_state.get("position", symbol_state.get("base"))
@@ -804,8 +791,6 @@ def run_bot_cycle(client, state, positions: dict, equity: float) -> None:
                 saved_override = float("nan")
             if math.isfinite(saved_override) and 0 < saved_override < 1:
                 state.setdefault("trailing_stop_pct", {})[symbol] = saved_override
-        for key, value in persisted.get("custom_settings", {}).items():
-            state[f"{key}_{symbol}"] = value
         saved_buy_date = persisted.get("last_buy_date")
         if symbol not in last_buy and saved_buy_date:
             try:
@@ -905,8 +890,6 @@ def init_state() -> None:
                 saved_hwm = float("nan")
             if math.isfinite(saved_hwm) and saved_hwm > 0:
                 st.session_state["bot_high_water_marks"][symbol] = saved_hwm
-            for key, value in record.get("custom_settings", {}).items():
-                st.session_state[f"{key}_{symbol}"] = value
             last_buy_date = record.get("last_buy_date")
             if last_buy_date:
                 try:
@@ -1078,61 +1061,15 @@ def rsi_label(rsi: float, params: StrategyParams = PARAMS) -> str:
     return f":{color}[RSI **{rsi:.1f}**]"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _cached_portfolio_history(_client, credential_scope: str):
-    request = GetPortfolioHistoryRequest(period="all", timeframe="1D")
-    return _client.get_portfolio_history(history_filter=request)
-
-
-def build_portfolio_history_frame(history) -> tuple[pd.DataFrame, float | None]:
-    timestamps = getattr(history, "timestamp", [])
-    equity_values = getattr(history, "equity", [])
-    base_value = _number_or_nan(getattr(history, "base_value", None))
-    if not timestamps or len(timestamps) != len(equity_values):
-        return pd.DataFrame(columns=["Equity"]), base_value if math.isfinite(base_value) else None
-
-    frame = pd.DataFrame({
-        "Timestamp": pd.to_datetime(timestamps, unit="s", utc=True, errors="coerce"),
-        "Equity": pd.to_numeric(equity_values, errors="coerce"),
-    }).dropna()
-    frame = frame.sort_values("Timestamp").set_index("Timestamp")
-    return frame, base_value if math.isfinite(base_value) else None
-
-
-def portfolio_history_chart(history: pd.DataFrame) -> go.Figure:
-    figure = go.Figure()
-    figure.add_trace(go.Scatter(
-        x=history.index,
-        y=history["Equity"],
-        mode="lines",
-        name="Equity",
-        line={"color": "#16834a", "width": 2},
-        fill="tozeroy",
-        fillcolor="rgba(22, 131, 74, 0.10)",
-        hovertemplate="%{x|%d %b %Y}<br>$%{y:,.2f}<extra></extra>",
-    ))
-    figure.update_layout(
-        title="Equity del conto (include i flussi di cassa)",
-        height=280,
-        margin={"l": 10, "r": 20, "t": 45, "b": 10},
-        hovermode="x unified",
-        showlegend=False,
-    )
-    figure.update_yaxes(title_text="Equity (USD)", tickprefix="$", separatethousands=True)
-    figure.update_xaxes(title_text="")
-    return figure
-
-
 def render_header(client, account_error: str | None, equity: float | None, positions: dict) -> None:
-    cols = st.columns(6)
+    cols = st.columns(5)
     bots = sum(bool(on) for on in st.session_state["bot_enabled"].values())
     if client is None or equity is None:
         cols[0].metric("Account Equity", "—")
-        cols[1].metric("Variazione da inizio", "—")
-        cols[2].metric("Capitale investito", "—")
-        cols[3].metric("Posizioni aperte", "—")
-        cols[4].metric("P&L oggi (non realizzato)", "—")
-        cols[5].metric("Bot attivi", bots)
+        cols[1].metric("Capitale investito", "—")
+        cols[2].metric("Posizioni aperte", "—")
+        cols[3].metric("P&L oggi (non realizzato)", "—")
+        cols[4].metric("Bot attivi", bots)
         st.warning(account_error or NO_KEYS_MESSAGE)
         return
     today_pl = 0.0
@@ -1150,47 +1087,11 @@ def render_header(client, account_error: str | None, equity: float | None, posit
                 cost_basis = entry_price * quantity
         if math.isfinite(cost_basis):
             invested_capital += abs(cost_basis)
-    history_frame = pd.DataFrame(columns=["Equity"])
-    capital_change = None
-    capital_change_pct = None
-    history_error = None
-    try:
-        realized_pnl = get_total_realized_pnl(client)
-        unrealized_pnl = sum(
-            float(getattr(position, "unrealized_pl", 0) or 0)
-            for position in positions.values()
-        )
-        capital_change = realized_pnl + unrealized_pnl
-        api_key, secret, _ = _live_credentials()
-        if api_key and secret:
-            credential_scope = hashlib.sha256(f"{api_key}:{secret}".encode()).hexdigest()
-            history = _cached_portfolio_history(client, credential_scope)
-            history_frame, base_value = build_portfolio_history_frame(history)
-            if base_value is not None and base_value > 0:
-                capital_change_pct = capital_change / base_value * 100
-    except Exception as exc:
-        history_error = f"Metriche P&L non disponibili: {exc}"
-
     cols[0].metric("Account Equity", f"${equity:,.2f}")
-    cols[1].metric(
-        "P&L trading (realizzato + aperto)",
-        f"${capital_change:+,.2f}" if capital_change is not None else "—",
-        delta=f"{capital_change_pct:+.2f}%" if capital_change_pct is not None else None,
-    )
-    cols[2].metric("Capitale investito", f"${invested_capital:,.2f}")
-    cols[3].metric("Posizioni aperte", len(positions))
-    cols[4].metric("P&L oggi (non realizzato)", f"${today_pl:,.2f}", delta=f"{today_pl:,.2f}")
-    cols[5].metric("Bot attivi", bots)
-    if not history_frame.empty:
-        st.plotly_chart(
-            portfolio_history_chart(history_frame),
-            width="stretch",
-            config={"responsive": True, "displaylogo": False},
-            key="account_equity_history",
-        )
-        st.caption("Il grafico mostra l'equity del conto; il KPI P&L usa invece P&L realizzato + non realizzato.")
-    if history_error:
-        st.caption(history_error)
+    cols[1].metric("Capitale investito", f"${invested_capital:,.2f}")
+    cols[2].metric("Posizioni aperte", len(positions))
+    cols[3].metric("P&L oggi (non realizzato)", f"${today_pl:,.2f}", delta=f"{today_pl:,.2f}")
+    cols[4].metric("Bot attivi", bots)
     if account_error:
         st.warning(account_error)
 

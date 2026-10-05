@@ -1,1 +1,4 @@
 bot_state.json
+bot_state.db
+bot_state.db-shm
+bot_state.db-wal

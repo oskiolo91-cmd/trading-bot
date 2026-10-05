@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -139,29 +140,39 @@ def test_risk_profile_change_replaces_open_native_trail():
     assert client.replaced[0][1].trail == pytest.approx(4.7)
 
 
-def test_json_state_round_trips_profile_custom_values_hwm_and_last_buy(tmp_path):
-    path = tmp_path / "bot_state.json"
+def test_sqlite_state_round_trips_risk_fields_and_last_buy(tmp_path):
+    path = tmp_path / "bot_state.db"
 
     update_symbol_state(
         "SPY",
         {
             "profile": "⚖️ Bilanciato",
-            "trailing_pct": 0.06,
             "custom_trailing_pct": 0.047,
             "high_water_mark": 123.45,
             "last_buy_date": datetime(2026, 10, 2, tzinfo=timezone.utc).date().isoformat(),
-            "custom_settings": {"custom_budget": 150.0},
         },
         path,
     )
 
     assert get_symbol_state("SPY", path)["high_water_mark"] == 123.45
-    assert load_bot_state(path)["symbols"]["SPY"]["custom_settings"]["custom_budget"] == 150.0
+    record = load_bot_state(path)["symbols"]["SPY"]
+    assert record["profile"] == "⚖️ Bilanciato"
+    assert record["custom_trailing_pct"] == pytest.approx(0.047)
+    assert record["trailing_pct"] == pytest.approx(0.047)
+    assert record["last_buy_date"] == "2026-10-02"
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tickers_state)")}
+    assert columns == {
+        "symbol", "profilo_rischio", "custom_trailing_pct", "high_water_mark", "last_buy_date"
+    }
 
 
-def test_corrupt_json_state_is_reported_and_recovers_as_empty(tmp_path, caplog):
-    path = tmp_path / "bot_state.json"
-    path.write_text("{not json", encoding="utf-8")
-
-    assert load_bot_state(path) == {"symbols": {}}
-    assert "Cannot read bot state" in caplog.text
+def test_sqlite_state_updates_fields_without_overwriting_others(tmp_path):
+    path = tmp_path / "bot_state.db"
+    update_symbol_state("SPY", {"profile": "⚖️ Bilanciato", "high_water_mark": 123.45}, path)
+    update_symbol_state("SPY", {"last_buy_date": "2026-10-02"}, path)
+    assert load_bot_state(path)["symbols"]["SPY"]["profile"] == "⚖️ Bilanciato"
+    state = get_symbol_state("SPY", path)
+    assert state["profile"] == "⚖️ Bilanciato"
+    assert state["high_water_mark"] == 123.45
+    assert state["last_buy_date"] == "2026-10-02"
